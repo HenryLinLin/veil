@@ -3,8 +3,10 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var item: NSStatusItem!
     private let controller = VeilController()
+    private let hotkeys = Hotkeys()
     func applicationDidFinishLaunching(_ notification: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        hotkeys.toggle = { [weak self] in self?.controller.toggle() }
         controller.changed = { [weak self] in self?.refresh() }
         refresh()
     }
