@@ -6,6 +6,7 @@ final class VeilController {
     var changed: (() -> Void)?
     let overlays = OverlayManager()
     private var timer: Timer?
+    private let tracker = MaskTracker()
     func toggle() { armed ? stop() : start() }
     func start() {
         guard !armed else { return }
@@ -19,17 +20,19 @@ final class VeilController {
         timer = nil
         armed = false
         masks.removeAll()
+        tracker.reset()
         overlays.clear()
         changed?()
     }
     private func tick() {
         let windows = ScreenWindow.visible()
-        masks = windows.flatMap { window -> [Mask] in
+        let current = windows.flatMap { window -> [Mask] in
             guard let rule = WindowRule.defaults.first(where: { $0.matches(window) }) else { return [] }
             return window.visibleParts(of: window.bounds, in: windows).map {
                 Mask(rect: $0, rule: rule.id, app: window.app, windowID: window.id)
             }
         }
+        masks = tracker.update(current, windows: windows)
         overlays.show(masks)
         changed?()
     }
