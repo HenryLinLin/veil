@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Veil · \(state)", action: nil, keyEquivalent: "")
         let presenting = menu.addItem(withTitle: controller.armed ? "Stop Presenting" : "Start Presenting", action: #selector(toggle), keyEquivalent: "p")
         presenting.target = self
+        if let error = controller.error { menu.addItem(withTitle: error, action: nil, keyEquivalent: "") }
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Veil", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
