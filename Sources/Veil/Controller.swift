@@ -7,12 +7,21 @@ final class VeilController {
     private var engine: CoreEngine?
     private let accessibility = AccessibilityReader()
     private let capture = ScreenCapture()
+    private let feed = FeedManager()
+    var feedMode = false
     private var ocrMasks: [CGDirectDisplayID: [Mask]] = [:]
     private var textMasks: [Mask] = []
     var changed: (() -> Void)?
     let overlays = OverlayManager()
     private var timer: Timer?
     private let tracker = MaskTracker()
+    func toggleMode() {
+        let resume = armed
+        if resume { stop() }
+        feedMode.toggle()
+        if resume { start() }
+        changed?()
+    }
     func toggle() { armed ? stop() : start() }
     func start() {
         guard !armed else { return }
@@ -21,10 +30,10 @@ final class VeilController {
         accessibility.onMasks = { [weak self] masks in self?.textMasks = masks }
         armed = true
         capture.onScannedFrame = { [weak self] frame, lines in self?.scanned(frame, lines: lines) }
-        capture.onFailure = { [weak self] message in self?.error = message; self?.changed?() }
+        capture.onFailure = { [weak self] message in self?.error = message; self?.feed.clear(); self?.changed?() }
         Task { @MainActor in
             guard self.armed else { return }
-            do { try await self.capture.start() }
+            do { try await self.capture.start(fullFrameScanning: self.feedMode) }
             catch { self.error = "Screen Recording is required for OCR: " + error.localizedDescription; self.changed?() }
         }
         tick()
@@ -37,6 +46,7 @@ final class VeilController {
         armed = false
         accessibility.stop()
         capture.stop()
+        feed.closeAll()
         ocrMasks.removeAll()
         engine = nil
         textMasks.removeAll()
@@ -60,8 +70,22 @@ final class VeilController {
                 }
             }
             ocrMasks[frame.displayID] = (ocrMasks[frame.displayID] ?? []).filter { !$0.rect.intersects(frame.scannedBounds) } + fresh
+            if feedMode {
+                let windowMasks = windows.filter { window in WindowRule.defaults.contains { $0.matches(window) } }
+                    .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
+                let current = fresh + windowMasks + textMasks
+                let sx = Double(frame.image.width) / frame.displayBounds.width
+                let sy = Double(frame.image.height) / frame.displayBounds.height
+                let rects = current.compactMap { mask -> CGRect? in
+                    let r = mask.rect.intersection(frame.displayBounds)
+                    guard !r.isNull, !r.isEmpty else { return nil }
+                    return CGRect(x: (r.minX - frame.displayBounds.minX) * sx, y: (r.minY - frame.displayBounds.minY) * sy, width: r.width * sx, height: r.height * sy)
+                }
+                feed.publish(displayID: frame.displayID, image: frame.image, masks: rects, delay: 0.5)
+            }
         } catch {
             self.error = error.localizedDescription
+            feed.clear()
             ocrMasks[frame.displayID] = [Mask(rect: frame.displayBounds, rule: "detector-error", app: "screen")]
         }
     }
@@ -75,7 +99,7 @@ final class VeilController {
         }
         if let engine { accessibility.scan(windows: windows, engine: engine) }
         masks = tracker.update(current + textMasks + ocrMasks.values.flatMap { $0 }, windows: windows)
-        overlays.show(masks)
+        if feedMode { overlays.clear() } else { overlays.show(masks) }
         changed?()
     }
 }
