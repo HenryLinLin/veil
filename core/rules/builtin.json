@@ -1,0 +1,114 @@
+[
+  {
+    "id": "aws-access-key",
+    "pattern": "\\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9l]{16}\\b",
+    "score": 1,
+    "tier": "known",
+    "validator": "aws"
+  },
+  {
+    "id": "github-token",
+    "pattern": "\\b(?:gh[pousr]_[A-Za-z0-9]*|github_pat_[A-Za-z0-9_]*)",
+    "score": 1,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "stripe-key",
+    "pattern": "\\b(?:sk|rk)_live_[A-Za-z0-9]*",
+    "score": 1,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "slack-token",
+    "pattern": "\\bxox[baprs]-[A-Za-z0-9-]+",
+    "score": 1,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "google-api-key",
+    "pattern": "\\bAIza[A-Za-z0-9_-]{20,}",
+    "score": 0.98,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "anthropic-key",
+    "pattern": "\\bsk-ant-[A-Za-z0-9_-]+",
+    "score": 1,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "openai-key",
+    "pattern": "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}",
+    "score": 0.97,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "private-key",
+    "pattern": "(?s:-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----.*?(?:-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----|\\z))",
+    "score": 1,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "jwt",
+    "pattern": "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{8,}",
+    "score": 0.9,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "database-password",
+    "pattern": "(?i:\\b(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|amqp)://[^\\s:/@]+:(?P<value>[^\\s/@]+)@[^\\s]+)",
+    "score": 0.97,
+    "tier": "known",
+    "validator": "none"
+  },
+  {
+    "id": "generic-secret",
+    "pattern": "(?i:\\b[A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*[\"']?\\s*[=:]\\s*[\"']?(?P<value>[A-Za-z0-9_./+~=-]{16,}))",
+    "score": 0.76,
+    "tier": "generic",
+    "validator": "entropy"
+  },
+  {
+    "id": "credit-card",
+    "pattern": "\\b[0-9OlI](?:[ -]?[0-9OlI]){12,18}\\b",
+    "score": 0.96,
+    "tier": "personal",
+    "validator": "card"
+  },
+  {
+    "id": "iban",
+    "pattern": "\\b[A-Za-z]{2}[0-9OlI]{2}(?: ?[A-Za-z0-9]){11,30}\\b",
+    "score": 0.98,
+    "tier": "personal",
+    "validator": "iban"
+  },
+  {
+    "id": "ssn",
+    "pattern": "\\b[0-9OlI]{3}[- ][0-9OlI]{2}[- ][0-9OlI]{4}\\b",
+    "score": 0.9,
+    "tier": "personal",
+    "validator": "ssn"
+  },
+  {
+    "id": "email",
+    "pattern": "\\b[A-Za-z0-9.!#$%&\\x27*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\\b",
+    "score": 0.85,
+    "tier": "email",
+    "validator": "none"
+  },
+  {
+    "id": "phone",
+    "pattern": "(?:\\+|\\b)[0-9](?:[ ()-]{0,3}[0-9]){9,14}\\b",
+    "score": 0.82,
+    "tier": "phone",
+    "validator": "phone"
+  }
+]
