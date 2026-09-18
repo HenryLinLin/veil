@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "rules": [
+    { "id": "demo-service-token", "pattern": "\\bDEMO_secret_[A-Za-z0-9]{16,}\\b", "score": 0.98 }
+  ]
+}
