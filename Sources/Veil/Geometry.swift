@@ -72,4 +72,5 @@ struct Mask {
     var app: String
     var hash: String = ""
     var windowID: CGWindowID = 0
+    var anchor: CGRect? = nil
 }
