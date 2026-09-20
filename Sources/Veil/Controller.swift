@@ -56,6 +56,10 @@ final class VeilController {
     }
     private var ocrMasks: [CGDirectDisplayID: [Mask]] = [:]
     private var textMasks: [Mask] = []
+    private var paths: [CGWindowID: (title: Int, path: String)] = [:]
+    private var scanTitles: [CGWindowID: Int] = [:]
+    private var axDirty = true
+    private var lastAX: TimeInterval = -.infinity
     var changed: (() -> Void)?
     let overlays = OverlayManager()
     private var timer: Timer?
@@ -78,6 +82,15 @@ final class VeilController {
         manualSession = manual
         session.start()
         accessibility.onMasks = { [weak self] masks in self?.textMasks = masks }
+        accessibility.onInvalidation = { [weak self] in self?.axDirty = true }
+        accessibility.onPaths = { [weak self] found in
+            guard let self, self.armed else { return }
+            for (id, path) in found {
+                if let title = self.scanTitles[id] { self.paths[id] = (title, path) }
+            }
+        }
+        axDirty = true
+        lastAX = -.infinity
         armed = true
         capture.onScannedFrame = { [weak self] frame, lines in self?.scanned(frame, lines: lines) }
         capture.onFailure = { [weak self] message in self?.error = message; self?.feed.clear(); self?.changed?() }
@@ -103,6 +116,8 @@ final class VeilController {
         ocrMasks.removeAll()
         engine = nil
         textMasks.removeAll()
+        paths.removeAll()
+        scanTitles.removeAll()
         masks.removeAll()
         tracker.reset()
         overlays.clear()
@@ -116,16 +131,16 @@ final class VeilController {
         do {
             for line in lines {
                 let owner = windows.first { $0.bounds.contains(CGPoint(x: line.bounds.midX, y: line.bounds.midY)) && $0.layer == 0 }
-                for hit in try engine.scan(line.text, title: owner?.title ?? "", ocr: true) {
+                for hit in try engine.scan(line.text, title: owner?.title ?? "", path: owner.map { path(for: $0) } ?? "", ocr: true) {
                     let rect = hit.rule == "private-key" ? (owner?.bounds ?? frame.displayBounds) :
                         (line.bounds(forUTF8Range: hit.start..<hit.end) ?? line.bounds).insetBy(dx: -4, dy: -4)
                     fresh.append(Mask(rect: rect.intersection(frame.displayBounds), rule: hit.rule,
-                                      app: owner?.app ?? "screen", hash: hit.hash, windowID: owner?.id ?? 0))
+                                      app: owner?.app ?? "screen", hash: hit.hash, windowID: owner?.id ?? 0, anchor: owner?.bounds))
                 }
             }
             ocrMasks[frame.displayID] = (ocrMasks[frame.displayID] ?? []).filter { !$0.rect.intersects(frame.scannedBounds) } + fresh
             if feedMode {
-                let windowMasks = windows.filter { window in store.current.windowRules.contains { $0.matches(window) } }
+                let windowMasks = windows.filter { window in self.windowRule(for: window) != nil }
                     .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
                 let current = fresh + windowMasks + textMasks
                 let sx = Double(frame.image.width) / frame.displayBounds.width
@@ -143,15 +158,30 @@ final class VeilController {
             ocrMasks[frame.displayID] = [Mask(rect: frame.displayBounds, rule: "detector-error", app: "screen")]
         }
     }
+    private func path(for window: ScreenWindow) -> String {
+        guard let value = paths[window.id], value.title == window.title.hashValue else { return "" }
+        return value.path
+    }
+    private func windowRule(for window: ScreenWindow) -> WindowRule? {
+        if store.current.allowedPaths.contains(path(for: window)) { return nil }
+        return store.current.windowRules.first { $0.matches(window) && !store.current.disabledRules.contains($0.id) }
+    }
     private func tick() {
         let windows = ScreenWindow.visible()
         let current = windows.flatMap { window -> [Mask] in
-            guard let rule = store.current.windowRules.first(where: { $0.matches(window) }) else { return [] }
+            guard let rule = windowRule(for: window) else { return [] }
             return window.visibleParts(of: window.bounds, in: windows).map {
                 Mask(rect: $0, rule: rule.id, app: window.app, windowID: window.id)
             }
         }
-        if let engine { accessibility.scan(windows: windows, engine: engine) }
+        paths = paths.filter { id, value in windows.contains { $0.id == id && $0.title.hashValue == value.title } }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let engine, !accessibility.isScanning, (axDirty && now - lastAX >= 0.2) || now - lastAX >= 0.8 {
+            scanTitles = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0.title.hashValue) })
+            axDirty = false
+            lastAX = now
+            accessibility.scan(windows: windows, engine: engine)
+        }
         masks = tracker.update(current + textMasks + ocrMasks.values.flatMap { $0 }, windows: windows)
         session.record(masks)
         if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
