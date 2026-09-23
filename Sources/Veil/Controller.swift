@@ -142,7 +142,7 @@ final class VeilController {
             if feedMode {
                 let windowMasks = windows.filter { window in self.windowRule(for: window) != nil }
                     .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
-                let current = fresh + windowMasks + textMasks
+                let current = (fresh + windowMasks + textMasks).filter { permitted($0, in: windows) }
                 let sx = Double(frame.image.width) / frame.displayBounds.width
                 let sy = Double(frame.image.height) / frame.displayBounds.height
                 let rects = current.compactMap { mask -> CGRect? in
@@ -166,6 +166,13 @@ final class VeilController {
         if store.current.allowedPaths.contains(path(for: window)) { return nil }
         return store.current.windowRules.first { $0.matches(window) && !store.current.disabledRules.contains($0.id) }
     }
+    private func permitted(_ mask: Mask, in windows: [ScreenWindow]) -> Bool {
+        guard !store.current.disabledRules.contains(mask.rule) else { return false }
+        if let window = windows.first(where: { $0.id == mask.windowID }) {
+            return !store.current.allowedPaths.contains(path(for: window))
+        }
+        return true
+    }
     private func tick() {
         let windows = ScreenWindow.visible()
         let current = windows.flatMap { window -> [Mask] in
@@ -182,7 +189,8 @@ final class VeilController {
             lastAX = now
             accessibility.scan(windows: windows, engine: engine)
         }
-        masks = tracker.update(current + textMasks + ocrMasks.values.flatMap { $0 }, windows: windows)
+        let detected = (current + textMasks + ocrMasks.values.flatMap { $0 }).filter { permitted($0, in: windows) }
+        masks = tracker.update(detected, windows: windows)
         session.record(masks)
         if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
         changed?()
