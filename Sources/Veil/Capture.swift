@@ -1,5 +1,6 @@
 import AppKit
 import CoreImage
+@preconcurrency import CoreVideo
 import ScreenCaptureKit
 import Vision
 
@@ -98,6 +99,7 @@ final class ScreenCapture {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
             guard isActive(token) else { return }
             let ownApps = content.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+            guard !ownApps.isEmpty else { throw CaptureError.ownApplicationMissing }
             let testWindows = content.windows.filter {
                 $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier && $0.title == "Veil Test"
             }
@@ -302,10 +304,11 @@ final class ScreenCapture {
 }
 
 private enum CaptureError: LocalizedError {
-    case noDisplays, invalidCrop
+    case noDisplays, invalidCrop, ownApplicationMissing
     var errorDescription: String? {
         switch self {
         case .noDisplays: return "No display is available for capture."
+        case .ownApplicationMissing: return "Veil could not exclude its own windows. Open Permissions & Test and retry."
         case .invalidCrop: return "The captured frame has invalid bounds."
         }
     }
