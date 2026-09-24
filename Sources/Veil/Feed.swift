@@ -12,13 +12,15 @@ final class FeedCompositor {
         }
     }
 
+    var isAvailable: Bool { context != nil }
+
     func redact(_ image: CGImage, masks: [CGRect]) -> CGImage? {
         guard let context, image.width > 0, image.height > 0 else { return nil }
         let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
         let black = CIImage(color: CIColor(red: 0.025, green: 0.025, blue: 0.03, alpha: 1))
         var protected = CIImage(cgImage: image).composited(over: black.cropped(to: bounds))
         for mask in masks {
-            guard [mask.minX, mask.minY, mask.width, mask.height].allSatisfy({ $0.isFinite }),
+            guard [mask.minX, mask.minY, mask.maxX, mask.maxY, mask.width, mask.height].allSatisfy({ $0.isFinite }),
                   mask.width >= 0, mask.height >= 0 else { return nil }
             let padded = mask.integral.insetBy(dx: -3, dy: -3).intersection(bounds)
             if padded.isNull || padded.isEmpty { continue }
@@ -184,6 +186,22 @@ final class FeedManager {
     private var windows: [UInt32: FeedWindow] = [:]
     private var dismissedDisplays = Set<UInt32>()
     private var timer: Timer?
+
+    var isAvailable: Bool { compositor.isAvailable }
+    func prepare(displayIDs: [UInt32]) {
+        for id in Array(windows.keys) where !displayIDs.contains(id) { windows.removeValue(forKey: id)?.window.close() }
+        dismissedDisplays.formIntersection(Set(displayIDs))
+        for id in displayIDs where windows[id] == nil && !dismissedDisplays.contains(id) {
+            let window = FeedWindow(displayID: id)
+            windows[id] = window
+            window.onClose = { [weak self] in
+                self?.windows.removeValue(forKey: id)
+                self?.dismissedDisplays.insert(id)
+                self?.stopIfEmpty()
+            }
+        }
+        if !windows.isEmpty { startTimer() }
+    }
 
     func publish(displayID: UInt32, image: CGImage, masks: [CGRect], delay: Double) {
         precondition(Thread.isMainThread)

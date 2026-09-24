@@ -78,6 +78,12 @@ final class VeilController {
     func start(manual: Bool = true) {
         guard !armed else { if manual { manualSession = true }; return }
         do { engine = try CoreEngine(config: store.current.engineJSON()) } catch { self.error = error.localizedDescription; changed?(); return }
+        if feedMode && !feed.isAvailable {
+            engine = nil
+            self.error = "Clean Feed requires Metal. Select Overlay on this Mac."
+            changed?()
+            return
+        }
         self.error = nil
         manualSession = manual
         session.start()
@@ -92,10 +98,18 @@ final class VeilController {
         axDirty = true
         lastAX = -.infinity
         armed = true
+        if feedMode {
+            feed.prepare(displayIDs: NSScreen.screens.compactMap { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value })
+        }
         capture.onScannedFrame = { [weak self] frame, lines in self?.scanned(frame, lines: lines) }
         capture.onFailure = { [weak self] message in self?.error = message; self?.feed.clear(); self?.changed?() }
         Task { @MainActor in
-            guard self.armed else { return }
+            guard self.armed, self.store.current.ocr || self.feedMode else { return }
+            guard CGPreflightScreenCaptureAccess() else {
+                self.error = "Grant Screen Recording in Permissions & Test to enable OCR and Clean Feed."
+                self.changed?()
+                return
+            }
             do { try await self.capture.start(ocrEnabled: self.store.current.ocr, fullFrameScanning: self.feedMode) }
             catch { self.error = "Screen Recording is required for OCR: " + error.localizedDescription; self.changed?() }
         }

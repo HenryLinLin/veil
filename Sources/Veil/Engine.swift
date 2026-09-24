@@ -13,7 +13,7 @@ final class CoreEngine {
     private let handle: OpaquePointer
     init(config: String = "{}") throws {
         var key = try Self.installationKey()
-        defer { key.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
+        defer { _ = key.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
         guard let engine = config.withCString({ config in key.withUnsafeBytes { veil_engine_new(config, $0.bindMemory(to: UInt8.self).baseAddress) } }) else {
             throw NSError(domain: "Veil", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not load detection rules."])
         }
@@ -23,7 +23,7 @@ final class CoreEngine {
     func scan(_ text: String, title: String = "", path: String = "", ocr: Bool = false) throws -> [EngineMatch] {
         let context = String(data: try! JSONSerialization.data(withJSONObject: ["title": title, "path": path, "ocr": ocr]), encoding: .utf8)!
         var input = Array(text.replacingOccurrences(of: "\0", with: " ").utf8CString)
-        defer { input.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
+        defer { _ = input.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
         guard let output = input.withUnsafeBufferPointer({ bytes in context.withCString { veil_engine_scan(handle, bytes.baseAddress, $0) } }) else { throw Self.scanError() }
         defer { veil_string_free(output) }
         struct Response: Decodable { let matches: [EngineMatch]; let error: String? }
