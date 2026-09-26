@@ -140,6 +140,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggle() { controller.toggle() }
     func applicationWillTerminate(_ notification: Notification) { controller.shutdown() }
 }
+if CommandLine.arguments.contains("--self-test") {
+    let destination = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("diagnostics.json")
+    do {
+        let results = try FeedChecks.run()
+        let report = try JSONSerialization.data(withJSONObject: ["passed": true, "checks": results], options: .prettyPrinted)
+        try report.write(to: destination, options: .atomic)
+        exit(0)
+    } catch {
+        let report = try! JSONSerialization.data(withJSONObject: ["passed": false, "error": String(describing: error)], options: .prettyPrinted)
+        try? report.write(to: destination, options: .atomic)
+        exit(1)
+    }
+}
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

@@ -44,10 +44,11 @@ final class VeilController {
         if show {
             overlays.clear()
             peekWarning.show()
-            peekTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            peekTimer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 if !CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(self.store.current.peekKey)) { self.setPeek(false) }
             }
+            if let peekTimer { RunLoop.main.add(peekTimer, forMode: .common) }
         } else {
             peekWarning.hide()
             if armed { tick() }
@@ -59,6 +60,8 @@ final class VeilController {
     private var paths: [CGWindowID: (title: Int, path: String)] = [:]
     private var scanTitles: [CGWindowID: Int] = [:]
     private var axDirty = true
+    private var scene: [WindowSignature] = []
+    private var sceneStableSince: TimeInterval = .infinity
     private var lastAX: TimeInterval = -.infinity
     var changed: (() -> Void)?
     let overlays = OverlayManager()
@@ -97,6 +100,8 @@ final class VeilController {
         }
         axDirty = true
         lastAX = -.infinity
+        scene = []
+        sceneStableSince = .infinity
         armed = true
         if feedMode {
             feed.prepare(displayIDs: NSScreen.screens.compactMap { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value })
@@ -110,11 +115,13 @@ final class VeilController {
                 self.changed?()
                 return
             }
-            do { try await self.capture.start(ocrEnabled: self.store.current.ocr, fullFrameScanning: self.feedMode) }
+            do { try await self.capture.start(ocrEnabled: self.store.current.ocr || self.feedMode, fullFrameScanning: self.feedMode) }
             catch { self.error = "Screen Recording is required for OCR: " + error.localizedDescription; self.changed?() }
         }
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        let clock = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(clock, forMode: .common)
+        timer = clock
         changed?()
     }
     func stop(showSummary: Bool = true) {
@@ -141,6 +148,11 @@ final class VeilController {
     private func scanned(_ frame: CapturedFrame, lines: [OCRLine]) {
         guard armed, let engine else { return }
         let windows = ScreenWindow.visible()
+        updateScene(windows)
+        if feedMode && (frame.windows != scene || sceneStableSince > frame.timestamp) {
+            feed.clear(displayID: frame.displayID)
+            return
+        }
         var fresh: [Mask] = []
         do {
             for line in lines {
@@ -187,8 +199,16 @@ final class VeilController {
         }
         return true
     }
+    private func updateScene(_ windows: [ScreenWindow]) {
+        let next = windows.map { WindowSignature(id: $0.id, pid: $0.pid, bounds: $0.bounds, layer: $0.layer, title: $0.title.hashValue) }
+        if next != scene || !sceneStableSince.isFinite {
+            scene = next
+            sceneStableSince = ProcessInfo.processInfo.systemUptime
+        }
+    }
     private func tick() {
         let windows = ScreenWindow.visible()
+        updateScene(windows)
         let current = windows.flatMap { window -> [Mask] in
             guard let rule = windowRule(for: window) else { return [] }
             return window.visibleParts(of: window.bounds, in: windows).map {

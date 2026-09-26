@@ -1,0 +1,130 @@
+import AppKit
+import Metal
+
+enum FeedChecks {
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private static func check(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+        if !condition() { throw Failure(description: message) }
+    }
+
+    private static func sample(width: Int = 100, height: Int = 80) -> CGImage {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()!
+    }
+
+    static func run() throws -> [String] {
+        var results: [String] = []
+        let source = sample()
+        var buffer = DelayedFeedBuffer()
+        try check(buffer.enqueue(source, at: 0, delay: 0.5), "First delayed frame rejected")
+        try check(buffer.ready(at: 0.499) == nil, "Frame escaped before its delay")
+        try check(buffer.ready(at: 0.5) != nil, "Frame was not released at its deadline")
+        try check(buffer.count == 0, "Released frame retained in queue")
+
+        for delay in [0.0, 0.5, 1.5, 2.0] {
+            var queue = DelayedFeedBuffer()
+            _ = queue.setDelay(delay)
+            var arrivals: [(CGImage, Double)] = []
+            var released = 0
+            for tick in 0...800 {
+                let now = Double(tick) / 100
+                if let image = queue.ready(at: now) {
+                    guard let arrival = arrivals.first(where: { ObjectIdentifier($0.0) == ObjectIdentifier(image) })?.1 else {
+                        throw Failure(description: "Queue emitted an unknown image")
+                    }
+                    try check(now - arrival >= delay - 0.000001, "Queue shortened the configured delay")
+                    released += 1
+                }
+                if queue.canAccept(at: now) {
+                    let frame = sample(width: 2, height: 2)
+                    if queue.enqueue(frame, at: now, delay: delay) { arrivals.append((frame, now)) }
+                }
+                try check(queue.count <= 6, "Queue exceeded six frames")
+            }
+            try check(released >= 10, "High input rate starved delayed output")
+        }
+
+        var full = DelayedFeedBuffer()
+        for index in 0..<6 {
+            try check(full.enqueue(source, at: Double(index) * 0.401, delay: 2), "Queue filled prematurely")
+        }
+        try check(!full.enqueue(source, at: 3, delay: 2), "Full queue accepted extra frame")
+        try check(full.ready(at: 2) != nil, "Overflow discarded the oldest delayed frame")
+        _ = full.setDelay(1.5)
+        try check(full.count == 0 && full.ready(at: 20) == nil, "Delay change retained prior frames")
+        _ = full.setDelay(.infinity)
+        try check(full.currentDelay == 2, "Invalid delay did not use the conservative maximum")
+        _ = full.setDelay(-1)
+        try check(full.currentDelay == 0, "Negative delay was not bounded")
+        full.clear()
+        try check(full.canAccept(at: 0), "Clear retained stale admission timestamps")
+        results.append("delay deadlines, adaptive admission, queue bounds and resets")
+
+        let old = try JSONDecoder().decode(Preferences.self, from: Data(#"{"emails":true}"#.utf8))
+        try check(old.emails && old.known && old.generic && old.personal && old.ocr,
+                  "Old preferences lost new-field defaults")
+        try check(old.mode == "overlay" && old.delay == 0.5 && old.presentKey == 35 && old.peekKey == 9,
+                  "Old preferences lost control defaults")
+        try check(!old.windowRules.isEmpty && old.allowedHashes.isEmpty && !old.ruleUpdates,
+                  "Old preferences lost privacy defaults")
+        var configured = old
+        configured.customRules = [CustomRule(id: "example", pattern: "example-[a-z]+", score: 0.9)]
+        configured.allowedHashes = [String(repeating: "a", count: 64)]
+        configured.allowedPaths = ["/tmp/example.txt"]
+        configured.disabledRules = ["example-disabled"]
+        let restored = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(configured))
+        try check(restored.customRules.first?.score == 0.9 && restored.allowedHashes == configured.allowedHashes,
+                  "Preferences round trip changed rule or hash values")
+        try check(restored.allowedPaths == configured.allowedPaths && restored.disabledRules == configured.disabledRules,
+                  "Preferences round trip changed allowlist values")
+        results.append("backward-compatible preferences and JSON round trip")
+
+        let compositor = FeedCompositor()
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            try check(compositor.redact(source, masks: []) == nil, "Compositor did not fail closed without Metal")
+            results.append("no-Metal fail-closed behavior; GPU pixel checks skipped")
+            return results
+        }
+        guard let protected = compositor.redact(source, masks: [CGRect(x: 30, y: 10, width: 20, height: 10)]),
+              let provider = protected.dataProvider?.data else {
+            throw Failure(description: "Metal compositor did not return a protected image")
+        }
+        let pixels = provider as Data
+        func pixel(_ x: Int, _ y: Int) -> [UInt8] {
+            let start = y * protected.bytesPerRow + x * 4
+            return Array(pixels[start..<(start + 4)])
+        }
+        let blocked = pixel(40, 15)
+        let padded = pixel(28, 8)
+        let clear = pixel(40, 65)
+        try check(blocked[0] < 64 && blocked[1] < 64 && blocked[2] < 64 && blocked[3] == 255,
+                  "Mask pixels are not dark and fully opaque")
+        try check(padded[0] < 64 && padded[3] == 255, "Mask padding is missing")
+        try check(clear[0] > 230 && clear[1] < 10 && clear[2] < 10 && clear[3] == 255,
+                  "Top-left mask geometry affected the wrong part of the frame")
+        try check(compositor.redact(source, masks: [CGRect(x: CGFloat.infinity, y: 1, width: 4, height: 4)]) == nil,
+                  "Nonfinite mask did not fail closed")
+        guard let reduced = compositor.redact(sample(width: 3200, height: 100), masks: []) else {
+            throw Failure(description: "Large image compositing failed")
+        }
+        try check(reduced.width <= 1600 && reduced.height <= 1000, "Sanitized queue image exceeded its size bound")
+        results.append("Metal opacity, padding, mask orientation and output dimensions")
+        return results
+    }
+}
+
+#if FEED_TEST_MAIN
+@main
+enum FeedTests {
+    static func main() throws {
+        for result in try FeedChecks.run() { print("ok: \(result)") }
+    }
+}
+#endif

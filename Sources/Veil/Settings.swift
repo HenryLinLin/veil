@@ -108,7 +108,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private let personal = NSButton(checkboxWithTitle: "Personal data", target: nil, action: nil)
     private let emails = NSButton(checkboxWithTitle: "Email addresses", target: nil, action: nil)
     private let phones = NSButton(checkboxWithTitle: "Phone numbers", target: nil, action: nil)
-    private let ocr = NSButton(checkboxWithTitle: "Use local OCR when app text is unavailable", target: nil, action: nil)
+    private let ocr = NSButton(checkboxWithTitle: "Use local OCR (always enabled for Clean Feed)", target: nil, action: nil)
     private let autoArm = NSButton(checkboxWithTitle: "Arm when a supported sharing indicator is detected", target: nil, action: nil)
     private let login = NSButton(checkboxWithTitle: "Launch Veil at login", target: nil, action: nil)
     private let modifiers = NSPopUpButton()
