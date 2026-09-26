@@ -10,6 +10,7 @@ struct CapturedFrame {
     let displayBounds: CGRect
     let scannedBounds: CGRect
     let timestamp: TimeInterval
+    let windows: [WindowSignature]
 }
 
 struct OCRLine {
@@ -53,6 +54,10 @@ struct OCRLine {
                       width: box.width * crop.width * sx,
                       height: box.height * crop.height * sy)
     }
+}
+
+private struct RetainedFrame: @unchecked Sendable {
+    let buffer: CVPixelBuffer
 }
 
 final class ScreenCapture {
@@ -116,7 +121,7 @@ final class ScreenCapture {
                 config.height = max(1, Int(Double(height) * scale))
                 config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
                 config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.showsCursor = false
+                config.showsCursor = fullFrameScanning
                 config.capturesAudio = false
                 config.queueDepth = 3
                 config.colorSpaceName = CGColorSpace.sRGB
@@ -190,7 +195,11 @@ final class ScreenCapture {
         }
         guard let settings else { return }
         let dirty = (metadata[.dirtyRects] as? [NSValue])?.map(\.rectValue)
-        let timestamp = ProcessInfo.processInfo.systemUptime
+        let now = ProcessInfo.processInfo.systemUptime
+        let presentation = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let timestamp = presentation.isFinite && presentation <= now && now - presentation < 2 ? presentation : now - 0.5
+        let windows = WindowSignature.current()
+        let retained = RetainedFrame(buffer: buffer)
         scanQueue.async { [weak self] in
             guard let self else { return }
             var deliveryPending = false
@@ -199,7 +208,7 @@ final class ScreenCapture {
             }
             guard self.isActive(token, revision: settings.2) else { return }
             autoreleasepool {
-                let input = CIImage(cvPixelBuffer: buffer)
+                let input = CIImage(cvPixelBuffer: retained.buffer)
                 guard let image = self.context.createCGImage(input, from: input.extent) else {
                     self.report("Could not read a captured frame.", token: token)
                     return
@@ -211,7 +220,7 @@ final class ScreenCapture {
                     self.cache[displayID] = ScanCache(generation: token, revision: settings.2,
                                                       imageSize: size)
                     let frame = CapturedFrame(image: image, displayID: displayID, displayBounds: displayBounds,
-                                              scannedBounds: result.scannedBounds, timestamp: timestamp)
+                                              scannedBounds: result.scannedBounds, timestamp: timestamp, windows: windows)
                     deliveryPending = true
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }

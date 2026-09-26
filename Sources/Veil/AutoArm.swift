@@ -35,7 +35,8 @@ final class AutoArm {
             return
         }
         guard timer == nil else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.check() }
+        timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.check() }
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
         check()
     }
     private func check() {
