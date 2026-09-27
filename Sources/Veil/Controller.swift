@@ -7,7 +7,7 @@ final class VeilController {
     private(set) var error: String?
     private var engine: CoreEngine?
     private let accessibility = AccessibilityReader()
-    private let capture = ScreenCapture()
+    private var capture = ScreenCapture()
     private let feed = FeedManager()
     let store = PreferencesStore()
     var feedMode: Bool { store.current.mode == "feed" }
@@ -16,7 +16,24 @@ final class VeilController {
     private var peekTimer: Timer?
     private(set) var peeking = false
     private var manualSession = false
+    private var sessionGeneration = 0
+    private var captureTask: Task<Void, Never>?
+    private var displayObserver: NSObjectProtocol?
+    private var sleepObserver: NSObjectProtocol?
     private(set) var notice: String?
+    init() {
+        displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                 object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.armed else { return }
+            let manual = self.manualSession
+            self.stop(showSummary: false)
+            self.start(manual: manual)
+        }
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification,
+                                                                          object: nil, queue: .main) { [weak self] _ in
+            self?.stop(showSummary: false)
+        }
+    }
     func configure() {
         watcher.onSharing = { [weak self] active, singleWindow in
             guard let self else { return }
@@ -103,20 +120,42 @@ final class VeilController {
         scene = []
         sceneStableSince = .infinity
         armed = true
+        sessionGeneration += 1
+        let revision = sessionGeneration
+        let capture = ScreenCapture()
+        self.capture = capture
         if feedMode {
             feed.prepare(displayIDs: NSScreen.screens.compactMap { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value })
         }
-        capture.onScannedFrame = { [weak self] frame, lines in self?.scanned(frame, lines: lines) }
-        capture.onFailure = { [weak self] message in self?.error = message; self?.feed.clear(); self?.changed?() }
-        Task { @MainActor in
-            guard self.armed, self.store.current.ocr || self.feedMode else { return }
+        capture.onScannedFrame = { [weak self] frame, lines in
+            guard let self, self.armed, self.sessionGeneration == revision else { return }
+            self.scanned(frame, lines: lines)
+        }
+        capture.onFailure = { [weak self] message in
+            guard let self, self.armed, self.sessionGeneration == revision else { return }
+            self.error = message
+            self.feed.clear()
+            self.changed?()
+        }
+        captureTask = Task { @MainActor [weak self] in
+            guard let self else { capture.stop(); return }
+            defer {
+                if !self.armed || self.sessionGeneration != revision || Task.isCancelled { capture.stop() }
+                if self.sessionGeneration == revision { self.captureTask = nil }
+            }
+            guard self.armed, self.sessionGeneration == revision, !Task.isCancelled,
+                  self.store.current.ocr || self.feedMode else { return }
             guard CGPreflightScreenCaptureAccess() else {
                 self.error = "Grant Screen Recording in Permissions & Test to enable OCR and Clean Feed."
                 self.changed?()
                 return
             }
-            do { try await self.capture.start(ocrEnabled: self.store.current.ocr || self.feedMode, fullFrameScanning: self.feedMode) }
-            catch { self.error = "Screen Recording is required for OCR: " + error.localizedDescription; self.changed?() }
+            do { try await capture.start(ocrEnabled: self.store.current.ocr || self.feedMode, fullFrameScanning: self.feedMode) }
+            catch {
+                guard self.armed, self.sessionGeneration == revision, !Task.isCancelled else { return }
+                self.error = "Screen Recording is required for OCR: " + error.localizedDescription
+                self.changed?()
+            }
         }
         tick()
         let clock = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
@@ -126,6 +165,9 @@ final class VeilController {
     }
     func stop(showSummary: Bool = true) {
         let hadSession = armed
+        sessionGeneration += 1
+        captureTask?.cancel()
+        captureTask = nil
         timer?.invalidate()
         timer = nil
         armed = false
@@ -228,5 +270,11 @@ final class VeilController {
         session.record(masks)
         if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
         changed?()
+    }
+
+    deinit {
+        captureTask?.cancel()
+        if let displayObserver { NotificationCenter.default.removeObserver(displayObserver) }
+        if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
     }
 }

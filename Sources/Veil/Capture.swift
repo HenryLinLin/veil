@@ -93,6 +93,7 @@ final class ScreenCapture {
     }
 
     func start(ocrEnabled: Bool = true, fullFrameScanning: Bool = false) async throws {
+        guard !Task.isCancelled else { return }
         stop()
         let token = locked { () -> Int in
             self.ocrEnabled = ocrEnabled
