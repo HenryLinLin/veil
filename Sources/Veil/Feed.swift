@@ -6,10 +6,10 @@ final class FeedCompositor {
     private let context: CIContext?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    init() {
-        context = MTLCreateSystemDefaultDevice().map {
-            CIContext(mtlDevice: $0, options: [.cacheIntermediates: false])
-        }
+    init(context: CIContext? = MTLCreateSystemDefaultDevice().map {
+        CIContext(mtlDevice: $0, options: [.cacheIntermediates: false])
+    }) {
+        self.context = context
     }
 
     var isAvailable: Bool { context != nil }

@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import Metal
 
 enum FeedChecks {
@@ -11,10 +12,11 @@ enum FeedChecks {
     }
 
     private static func sample(width: Int = 100, height: Int = 80) -> CGImage {
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-                                bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                bytesPerRow: width * 4, space: colorSpace,
                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.setFillColor(CGColor(colorSpace: colorSpace, components: [1, 0, 0, 1])!)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return context.makeImage()!
     }
@@ -86,15 +88,26 @@ enum FeedChecks {
                   "Preferences round trip changed allowlist values")
         results.append("backward-compatible preferences and JSON round trip")
 
+        let software = FeedCompositor(context: CIContext(options: [.useSoftwareRenderer: true]))
+        try renderingChecks(software)
+        results.append("software opacity, padding, mask orientation and output dimensions")
+
         let compositor = FeedCompositor()
         guard MTLCreateSystemDefaultDevice() != nil else {
             try check(compositor.redact(source, masks: []) == nil, "Compositor did not fail closed without Metal")
             results.append("no-Metal fail-closed behavior; GPU pixel checks skipped")
             return results
         }
+        try renderingChecks(compositor)
+        results.append("Metal opacity, padding, mask orientation and output dimensions")
+        return results
+    }
+
+    private static func renderingChecks(_ compositor: FeedCompositor) throws {
+        let source = sample()
         guard let protected = compositor.redact(source, masks: [CGRect(x: 30, y: 10, width: 20, height: 10)]),
               let provider = protected.dataProvider?.data else {
-            throw Failure(description: "Metal compositor did not return a protected image")
+            throw Failure(description: "Compositor did not return a protected image")
         }
         let pixels = provider as Data
         func pixel(_ x: Int, _ y: Int) -> [UInt8] {
@@ -108,23 +121,26 @@ enum FeedChecks {
                   "Mask pixels are not dark and fully opaque")
         try check(padded[0] < 64 && padded[3] == 255, "Mask padding is missing")
         try check(clear[0] > 230 && clear[1] < 10 && clear[2] < 10 && clear[3] == 255,
-                  "Top-left mask geometry affected the wrong part of the frame")
+                  "Unmasked pixel has the wrong color or position: \(clear)")
         try check(compositor.redact(source, masks: [CGRect(x: CGFloat.infinity, y: 1, width: 4, height: 4)]) == nil,
                   "Nonfinite mask did not fail closed")
         guard let reduced = compositor.redact(sample(width: 3200, height: 100), masks: []) else {
             throw Failure(description: "Large image compositing failed")
         }
         try check(reduced.width <= 1600 && reduced.height <= 1000, "Sanitized queue image exceeded its size bound")
-        results.append("Metal opacity, padding, mask orientation and output dimensions")
-        return results
     }
 }
 
 #if FEED_TEST_MAIN
 @main
 enum FeedTests {
-    static func main() throws {
-        for result in try FeedChecks.run() { print("ok: \(result)") }
+    static func main() {
+        do {
+            for result in try FeedChecks.run() { print("ok: \(result)") }
+        } catch {
+            FileHandle.standardError.write(Data("FAILED: \(error)\n".utf8))
+            exit(1)
+        }
     }
 }
 #endif
