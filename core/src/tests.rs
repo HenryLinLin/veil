@@ -405,3 +405,53 @@ fn invalid_iban_does_not_hide_a_later_valid_iban() {
         .collect();
     assert_eq!(values, ["DE89 3704 0044 0532 0130 00"]);
 }
+
+#[test]
+fn ssn_accepts_document_dashes_and_spacing_without_changing_byte_ranges() {
+    let engine = matcher();
+    for value in [
+        "123‐45‐6789",
+        "123‑45‑6789",
+        "123‒45‒6789",
+        "123–45–6789",
+        "123—45—6789",
+        "123−45−6789",
+        "123﹣45﹣6789",
+        "123－45－6789",
+        "123\u{a0}45\u{a0}6789",
+        "123\u{202f}45\u{202f}6789",
+        "123 - 45 - 6789",
+        "123 \u{2013} 45 \u{2013} 6789",
+    ] {
+        let text = format!("秘密 {value} done");
+        let results = engine.scan(&text, &Context::default());
+        assert_eq!(results.len(), 1, "{value}");
+        assert_eq!(results[0].rule, "ssn");
+        assert_eq!(&text[results[0].start..results[0].end], value);
+        assert_eq!(results[0].start, "秘密 ".len());
+        assert_eq!(results[0].hash, engine.hash(value));
+    }
+}
+
+#[test]
+fn ssn_ocr_spacing_keeps_component_validation() {
+    let engine = matcher();
+    let mut context = Context::default();
+    context.ocr = true;
+    let value = "l23 − 45 − 6789";
+    assert_eq!(engine.scan(value, &context).len(), 1);
+    assert!(engine.scan(value, &Context::default()).is_empty());
+    for invalid in [
+        "OOO – 45 – 6789",
+        "666 – 45 – 6789",
+        "900 – 45 – 6789",
+        "123 – OO – 6789",
+        "123 – 45 – OOOO",
+        "123\n45\n6789",
+        "123456789",
+        "123-456-7890",
+        "1123-45-67899",
+    ] {
+        assert!(engine.scan(invalid, &context).is_empty(), "{invalid}");
+    }
+}

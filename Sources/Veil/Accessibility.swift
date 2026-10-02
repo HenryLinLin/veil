@@ -17,12 +17,42 @@ private func axRect(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: p, size: s)
 }
 
+private func axChildren(_ element: AXUIElement) -> (elements: [AXUIElement], complete: Bool) {
+    var value: CFTypeRef?
+    let visible = AXUIElementCopyAttributeValue(element, kAXVisibleChildrenAttribute as CFString, &value)
+    if visible == .success, let children = value as? [AXUIElement] { return (children, true) }
+    value = nil
+    let all = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+    if all == .success, let children = value as? [AXUIElement] { return (children, true) }
+    let leafErrors: [AXError] = [.attributeUnsupported, .noValue, .notImplemented]
+    return ([], leafErrors.contains(visible) && leafErrors.contains(all))
+}
+
 private final class AXCallbackContext {
     weak var owner: AccessibilityReader?
     let generation: Int
-    init(_ owner: AccessibilityReader, generation: Int) {
+    let pid: pid_t
+    private let lock = NSLock()
+    private var contentWindows: [UInt: (CGWindowID, Set<String>)] = [:]
+    func registerContent(_ element: AXUIElement, windowID: CGWindowID, notification: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = CFHash(element)
+        guard contentWindows[key] != nil || contentWindows.count < 256 else { return }
+        var names = contentWindows[key]?.1 ?? []
+        names.insert(notification)
+        contentWindows[key] = (windowID, names)
+    }
+    func contentWindow(_ element: AXUIElement, notification: String) -> CGWindowID? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let (window, names) = contentWindows[CFHash(element)], names.contains(notification) else { return nil }
+        return window
+    }
+    init(_ owner: AccessibilityReader, generation: Int, pid: pid_t) {
         self.owner = owner
         self.generation = generation
+        self.pid = pid
     }
 }
 
@@ -37,9 +67,11 @@ private final class AXWatch {
 }
 
 final class AccessibilityReader {
-    var onMasks: (([Mask]) -> Void)?
+    var onMasks: (([Mask], TimeInterval) -> Void)?
     var onInvalidation: (() -> Void)?
+    var onContentInvalidation: ((Set<CGWindowID>) -> Void)?
     var onPaths: (([CGWindowID: String]) -> Void)?
+    var onScanCompleted: ((Set<CGWindowID>, TimeInterval) -> Void)?
     private let queue = DispatchQueue(label: "veil.accessibility", qos: .userInteractive)
     private let lock = NSLock()
     private var busy = false
@@ -53,6 +85,13 @@ final class AccessibilityReader {
     private var cachedMaskCount = 0
     private var overflowWindows: Set<CGWindowID> = []
     private var scanOffset = 0
+    private var priorityPID: pid_t?
+
+    func prioritize(pid: pid_t) {
+        precondition(Thread.isMainThread)
+        priorityPID = pid
+        onInvalidation?()
+    }
 
     private struct AreaID: Hashable {
         let window: CGWindowID
@@ -73,6 +112,8 @@ final class AccessibilityReader {
         let pid: pid_t
         let element: AXUIElement
         let names: [String]
+        var windowID: CGWindowID? = nil
+        var contentNames: Set<String> = []
     }
 
     func stop() {
@@ -84,6 +125,7 @@ final class AccessibilityReader {
         invalidation = nil
         stabilityCheck?.cancel()
         stabilityCheck = nil
+        priorityPID = nil
         observers.values.forEach { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource($0.observer), .commonModes) }
         observers.removeAll()
         queue.async { [weak self] in
@@ -91,6 +133,16 @@ final class AccessibilityReader {
             self?.cachedMasks.removeAll()
             self?.cachedMaskCount = 0
             self?.overflowWindows.removeAll()
+        }
+    }
+
+    func invalidateContent(windowIDs: Set<CGWindowID>) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.cachedMasks = self.cachedMasks.filter { !windowIDs.contains($0.key.window) }
+            self.previousAreas = self.previousAreas.filter { !windowIDs.contains($0.key.window) }
+            self.overflowWindows.subtract(windowIDs)
+            self.cachedMaskCount = self.cachedMasks.values.reduce(0) { $0 + $1.count }
         }
     }
 
@@ -109,17 +161,26 @@ final class AccessibilityReader {
         let order = Array(pids).sorted()
         let offset = order.isEmpty ? 0 : scanOffset % order.count
         scanOffset += 1
-        let rotated = Array(order.dropFirst(offset)) + Array(order.prefix(offset))
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let preferred = priorityPID.flatMap { pids.contains($0) ? $0 : nil }
+            ?? frontmost.flatMap { pids.contains($0) ? $0 : nil }
+            ?? windows.first(where: { $0.layer == 0 })?.pid
+        let rotated = (preferred.map { [$0] } ?? [])
+            + (Array(order.dropFirst(offset)) + Array(order.prefix(offset))).filter { $0 != preferred }
+        priorityPID = nil
         queue.async { [weak self] in
             guard let self else { return }
             var paths: [CGWindowID: String] = [:]
             var targets: [WatchTarget] = []
             var unstable = false
-            let deadline = ProcessInfo.processInfo.systemUptime + 0.18
+            var completedWindows: Set<CGWindowID> = []
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let deadline = startedAt + 0.18
             var remaining = 450
             for pid in rotated {
                 guard self.currentGeneration() == revision,
                       ProcessInfo.processInfo.systemUptime < deadline, remaining > 0 else { break }
+                let appDeadline = pid == preferred && rotated.count > 1 ? min(deadline, startedAt + 0.11) : deadline
                 let app = AXUIElementCreateApplication(pid)
                 AXUIElementSetMessagingTimeout(app, 0.025)
                 targets.append(WatchTarget(pid: pid, element: app, names: [kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification, kAXFocusedUIElementChangedNotification]))
@@ -127,21 +188,24 @@ final class AccessibilityReader {
                 guard let axWindows = axValue(app, kAXWindowsAttribute) as? [AXUIElement] else { continue }
                 for axWindow in axWindows.prefix(32) {
                     guard self.currentGeneration() == revision,
-                          ProcessInfo.processInfo.systemUptime < deadline, remaining > 0 else { break }
+                          ProcessInfo.processInfo.systemUptime < appDeadline, remaining > 0 else { break }
                     remaining -= 1
                     guard let rect = axRect(axWindow), let window = windows.first(where: {
                         $0.pid == pid && abs($0.bounds.minX - rect.minX) < 3 && abs($0.bounds.minY - rect.minY) < 3
                             && abs($0.bounds.width - rect.width) < 6 && abs($0.bounds.height - rect.height) < 6
                     }), !window.visibleParts(of: rect, in: windows).isEmpty else { continue }
                     if targets.count < 32 {
-                        targets.append(WatchTarget(pid: pid, element: axWindow, names: [kAXMovedNotification, kAXResizedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification, kAXLayoutChangedNotification]))
+                        targets.append(WatchTarget(pid: pid, element: axWindow, names: [kAXMovedNotification, kAXResizedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification, kAXLayoutChangedNotification],
+                                                   windowID: window.id, contentNames: [kAXResizedNotification, kAXWindowResizedNotification, kAXLayoutChangedNotification]))
                     }
                     let document = Self.documentPath(axWindow)
                     paths[window.id] = document
                     var pending = [axWindow]
                     var seenAreas: Set<AreaID> = []
+                    var traversalComplete = true
+                    var readText = false
                     while let element = pending.popLast(), remaining > 0,
-                          self.currentGeneration() == revision, ProcessInfo.processInfo.systemUptime < deadline {
+                          self.currentGeneration() == revision, ProcessInfo.processInfo.systemUptime < appDeadline {
                         remaining -= 1
                         seenAreas.insert(AreaID(window: window.id, element: CFHash(element)))
                         if let frame = axRect(element), frame.intersects(window.bounds),
@@ -149,24 +213,40 @@ final class AccessibilityReader {
                             let key = AreaID(window: window.id, element: CFHash(element))
                             var elementMasks: [Mask] = []
                             let role = axValue(element, kAXRoleAttribute) as? String ?? ""
+                            if (role == kAXScrollAreaRole || role == kAXScrollBarRole), targets.count < 32 {
+                                targets.append(WatchTarget(pid: pid, element: element,
+                                                           names: [kAXValueChangedNotification, kAXLayoutChangedNotification, kAXSelectedChildrenChangedNotification],
+                                                           windowID: window.id, contentNames: [kAXValueChangedNotification, kAXLayoutChangedNotification, kAXSelectedChildrenChangedNotification]))
+                            }
                             if let slice = Self.visibleText(element) {
+                                if !slice.text.isEmpty || role == kAXTextAreaRole || role == kAXTextFieldRole { readText = true }
                                 let textArea = role == kAXTextAreaRole || role == kAXTextFieldRole || slice.visibleRange != nil
-                                if textArea, targets.count < 32 {
-                                    targets.append(WatchTarget(pid: pid, element: element, names: [kAXValueChangedNotification, kAXSelectedTextChangedNotification, kAXLayoutChangedNotification]))
+                                let trackLayout = textArea || role == kAXStaticTextRole
+                                if trackLayout, targets.count < 32 {
+                                    targets.append(WatchTarget(pid: pid, element: element, names: [kAXValueChangedNotification, kAXSelectedTextChangedNotification, kAXLayoutChangedNotification, kAXMovedNotification],
+                                                               windowID: window.id, contentNames: [kAXLayoutChangedNotification, kAXMovedNotification]))
                                 }
                                 let hits: [EngineMatch]
-                                do { hits = try engine.scan(slice.text, title: window.title, path: document) }
+                                do {
+                                    if slice.text.isEmpty { hits = [] }
+                                    else { hits = try engine.scan(slice.text, title: window.title, path: document) }
+                                }
                                 catch {
+                                    traversalComplete = false
                                     self.storeMasks([Mask(rect: window.bounds, rule: "detector-error", app: window.app,
                                                           windowID: window.id, anchor: window.bounds)], for: key)
                                     continue
                                 }
-                                if textArea {
+                                if trackLayout {
                                     let now = ProcessInfo.processInfo.systemUptime
                                     var fingerprint = Hasher()
                                     fingerprint.combine(slice.text)
                                     fingerprint.combine(slice.visibleRange?.location ?? -1)
                                     fingerprint.combine(slice.visibleRange?.length ?? -1)
+                                    fingerprint.combine(Double(frame.minX - window.bounds.minX))
+                                    fingerprint.combine(Double(frame.minY - window.bounds.minY))
+                                    fingerprint.combine(Double(frame.width))
+                                    fingerprint.combine(Double(frame.height))
                                     let signature = fingerprint.finalize()
                                     let old = self.previousAreas[key]
                                     let changed = old.map { $0.signature != signature } ?? false
@@ -176,7 +256,8 @@ final class AccessibilityReader {
                                                                       hadSecret: !hits.isEmpty || (settling && old?.hadSecret == true))
                                     if settling && (!hits.isEmpty || old?.hadSecret == true) {
                                         unstable = true
-                                        elementMasks += window.visibleParts(of: frame, in: windows).map {
+                                        let movingArea = textArea ? frame : window.bounds
+                                        elementMasks += window.visibleParts(of: movingArea, in: windows).map {
                                             Mask(rect: $0, rule: "scrolling-text", app: window.app, windowID: window.id, anchor: window.bounds)
                                         }
                                     }
@@ -207,6 +288,9 @@ final class AccessibilityReader {
                                 }
                                 self.storeMasks(elementMasks, for: key)
                             } else {
+                                if role == kAXStaticTextRole || role == kAXTextAreaRole || role == kAXTextFieldRole {
+                                    traversalComplete = false
+                                }
                                 if self.previousAreas[key]?.hadSecret == true || self.cachedMasks[key]?.isEmpty == false {
                                     if let old = self.previousAreas[key] {
                                         self.previousAreas[key] = AreaState(signature: old.signature, changedAt: old.changedAt,
@@ -218,15 +302,17 @@ final class AccessibilityReader {
                                 }
                             }
                         }
-                        if let children = axValue(element, kAXVisibleChildrenAttribute) as? [AXUIElement] ?? axValue(element, kAXChildrenAttribute) as? [AXUIElement] {
-                            pending.append(contentsOf: children.prefix(max(0, remaining - pending.count)))
-                        }
+                        let children = axChildren(element)
+                        let capacity = max(0, remaining - pending.count)
+                        if !children.complete || children.elements.count > capacity { traversalComplete = false }
+                        pending.append(contentsOf: children.elements.prefix(capacity))
                     }
-                    if pending.isEmpty, remaining > 0, ProcessInfo.processInfo.systemUptime < deadline,
+                    if pending.isEmpty, traversalComplete, remaining > 0, ProcessInfo.processInfo.systemUptime < appDeadline,
                        self.currentGeneration() == revision {
                         self.cachedMasks = self.cachedMasks.filter { $0.key.window != window.id || seenAreas.contains($0.key) }
                         self.cachedMaskCount = self.cachedMasks.values.reduce(0) { $0 + $1.count }
                         self.previousAreas = self.previousAreas.filter { $0.key.window != window.id || seenAreas.contains($0.key) }
+                        if readText { completedWindows.insert(window.id) }
                     }
                 }
             }
@@ -247,8 +333,9 @@ final class AccessibilityReader {
                     self.observers[pid] = watch
                     CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(watch.observer), .commonModes)
                 }
-                self.onMasks?(masks)
+                self.onMasks?(masks, startedAt)
                 self.onPaths?(paths)
+                self.onScanCompleted?(completedWindows, startedAt)
                 if unstable { self.scheduleStabilityCheck(generation: revision) }
             }
         }
@@ -306,12 +393,13 @@ final class AccessibilityReader {
             guard currentGeneration() == generation, ProcessInfo.processInfo.systemUptime < deadline else { break }
             if watches[target.pid] == nil {
                 var observer: AXObserver?
-                guard AXObserverCreate(target.pid, { _, _, _, context in
+                guard AXObserverCreate(target.pid, { _, element, notification, context in
                     guard let context else { return }
                     let callback = Unmanaged<AXCallbackContext>.fromOpaque(context).takeUnretainedValue()
-                    callback.owner?.enqueueInvalidation(generation: callback.generation)
+                    let windowID = callback.contentWindow(element, notification: notification as String)
+                    callback.owner?.enqueueInvalidation(generation: callback.generation, pid: callback.pid, contentWindow: windowID)
                 }, &observer) == .success, let observer else { continue }
-                let watch = AXWatch(observer: observer, context: AXCallbackContext(self, generation: generation))
+                let watch = AXWatch(observer: observer, context: AXCallbackContext(self, generation: generation, pid: target.pid))
                 watches[target.pid] = watch
                 installed[target.pid] = watch
             }
@@ -320,6 +408,9 @@ final class AccessibilityReader {
             for name in target.names {
                 guard currentGeneration() == generation, ProcessInfo.processInfo.systemUptime < deadline, attempts < 24 else { break }
                 let key = "\(CFHash(target.element)):\(name)"
+                if let windowID = target.windowID, target.contentNames.contains(name) {
+                    watch.context.registerContent(target.element, windowID: windowID, notification: name)
+                }
                 guard !watch.registered.contains(key) else { continue }
                 attempts += 1
                 let status = AXObserverAddNotification(watch.observer, target.element, name as CFString,
@@ -332,9 +423,12 @@ final class AccessibilityReader {
         return installed
     }
 
-    fileprivate func enqueueInvalidation(generation: Int) {
+    fileprivate func enqueueInvalidation(generation: Int, pid: pid_t, contentWindow: CGWindowID?) {
         precondition(Thread.isMainThread)
-        guard currentGeneration() == generation, invalidation == nil else { return }
+        guard currentGeneration() == generation else { return }
+        priorityPID = pid
+        if let contentWindow { onContentInvalidation?([contentWindow]) }
+        guard invalidation == nil else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.invalidation = nil
