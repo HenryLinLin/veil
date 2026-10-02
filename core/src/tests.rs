@@ -378,3 +378,30 @@ fn concurrent_ffi_calls_use_the_worker_safely() {
         veil_engine_free(engine);
     }
 }
+
+#[test]
+fn adjacent_ibans_are_both_masked() {
+    let text = "GB82 WEST 1234 5698 7654 32 DE89 3704 0044 0532 0130 00";
+    let result = matcher().scan(text, &Context::default());
+    let values: Vec<_> = result
+        .iter()
+        .filter(|m| m.rule == "iban")
+        .map(|m| &text[m.start..m.end])
+        .collect();
+    assert_eq!(
+        values,
+        ["GB82 WEST 1234 5698 7654 32", "DE89 3704 0044 0532 0130 00"]
+    );
+}
+
+#[test]
+fn invalid_iban_does_not_hide_a_later_valid_iban() {
+    let text = "GB83 WEST 1234 5698 7654 32 DE89 3704 0044 0532 0130 00";
+    let result = matcher().scan(text, &Context::default());
+    let values: Vec<_> = result
+        .iter()
+        .filter(|m| m.rule == "iban")
+        .map(|m| &text[m.start..m.end])
+        .collect();
+    assert_eq!(values, ["DE89 3704 0044 0532 0130 00"]);
+}

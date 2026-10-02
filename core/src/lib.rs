@@ -354,7 +354,22 @@ impl Matcher {
             if !rule.enabled(&self.config) {
                 continue;
             }
-            for cap in self.regexes[i].captures_iter(text) {
+            let mut offset = 0;
+            while offset <= text.len() {
+                let Some(cap) = self.regexes[i].captures_at(text, offset) else {
+                    break;
+                };
+                let full = cap.get(0).unwrap();
+                offset = if rule.validator == "iban" || full.is_empty() {
+                    full.start()
+                        + text[full.start()..]
+                            .chars()
+                            .next()
+                            .map(char::len_utf8)
+                            .unwrap_or(1)
+                } else {
+                    full.end()
+                };
                 let Some(value) = cap.name("value").or_else(|| cap.get(0)) else {
                     continue;
                 };
@@ -364,6 +379,9 @@ impl Matcher {
                 };
                 if length == 0 {
                     continue;
+                }
+                if rule.validator == "iban" {
+                    offset = value.start() + length;
                 }
                 let raw = &value.as_str()[..length];
                 let hash = self.hash(raw);
