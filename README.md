@@ -1,7 +1,7 @@
 # Veil
 Local macOS screen-share masking and a delayed Clean Feed.
-Covers secrets on your screen while screensharing, so an API key, password, 
-credit card, or other private content never reaches the other side.
+Covers secrets on your screen while screensharing, so an API key, credit card, 
+or other private content never reaches the other side.
 Requires macOS 14+, Xcode Command Line Tools, Rust, and Metal for Clean Feed.
 Run `./scripts/build.sh`, then open `build/Veil.app`.
 Grant Accessibility and Screen Recording in Permissions & Test.
