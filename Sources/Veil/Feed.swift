@@ -85,9 +85,56 @@ struct DelayedFeedBuffer {
     }
 }
 
+struct FeedPlayback {
+    private var buffer = DelayedFeedBuffer()
+    private var lastFrameAt: TimeInterval?
+    private(set) var image: CGImage?
+    private(set) var isHeld = false
+    var pendingCount: Int { buffer.count }
+
+    mutating func setDelay(_ delay: TimeInterval) {
+        if buffer.setDelay(delay) { clear() }
+    }
+
+    func canAccept(at now: TimeInterval) -> Bool { buffer.canAccept(at: now) }
+
+    @discardableResult
+    mutating func publish(_ protectedImage: CGImage, at now: TimeInterval, delay: TimeInterval) -> Bool {
+        setDelay(delay)
+        guard buffer.enqueue(protectedImage, at: now, delay: delay) else { return false }
+        lastFrameAt = now
+        isHeld = false
+        tick(at: now)
+        return true
+    }
+
+    mutating func tick(at now: TimeInterval) {
+        guard !isHeld else { return }
+        guard let lastFrameAt else { return }
+        guard now - lastFrameAt <= buffer.currentDelay + 2 else {
+            hold()
+            return
+        }
+        if let ready = buffer.ready(at: now) { image = ready }
+    }
+
+    mutating func hold() {
+        buffer.clear()
+        lastFrameAt = nil
+        isHeld = true
+    }
+
+    mutating func clear() {
+        buffer.clear()
+        image = nil
+        lastFrameAt = nil
+        isHeld = false
+    }
+}
+
 private final class FeedCanvas: NSView {
     var frameImage: CGImage? {
-        didSet { needsDisplay = true }
+        didSet { if oldValue !== frameImage { needsDisplay = true } }
     }
     override var isOpaque: Bool { true }
 
@@ -117,12 +164,13 @@ private final class FeedCanvas: NSView {
 
 private final class FeedWindow: NSObject, NSWindowDelegate {
     let window: NSWindow
+    private let baseTitle: String
     private let canvas = FeedCanvas()
-    var buffer = DelayedFeedBuffer()
-    var lastFrameAt: TimeInterval?
+    var playback = FeedPlayback()
     var onClose: (() -> Void)?
 
     init(displayID: UInt32) {
+        baseTitle = "Veil Feed – display \(displayID)"
         let screen = NSScreen.screens.first {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID
         }
@@ -134,7 +182,7 @@ private final class FeedWindow: NSObject, NSWindowDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false, screen: screen)
         super.init()
-        window.title = "Veil Feed – display \(displayID)"
+        window.title = baseTitle
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 320, height: 210)
         window.delegate = self
@@ -162,17 +210,24 @@ private final class FeedWindow: NSObject, NSWindowDelegate {
     }
 
     func tick(at now: TimeInterval) {
-        if let lastFrameAt, now - lastFrameAt <= buffer.currentDelay + 2 {
-            if let image = buffer.ready(at: now) { canvas.frameImage = image }
-        } else {
-            clear()
-        }
+        playback.tick(at: now)
+        updateView()
+    }
+
+    func hold() {
+        playback.hold()
+        updateView()
     }
 
     func clear() {
-        buffer.clear()
-        canvas.frameImage = nil
-        lastFrameAt = nil
+        playback.clear()
+        updateView()
+    }
+
+    private func updateView() {
+        canvas.frameImage = playback.image
+        let title = playback.isHeld ? baseTitle + " · paused" : baseTitle
+        if window.title != title { window.title = title }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -220,16 +275,21 @@ final class FeedManager {
             startTimer()
         }
         let now = ProcessInfo.processInfo.systemUptime
-        if feed.buffer.setDelay(delay) { feed.clear() }
+        feed.playback.setDelay(delay)
         feed.tick(at: now)
-        guard feed.buffer.canAccept(at: now) else { return }
+        guard feed.playback.canAccept(at: now) else { return }
         guard let protected = autoreleasepool(invoking: { compositor.redact(image, masks: masks) }) else {
-            feed.clear()
+            feed.hold()
             return
         }
-        feed.lastFrameAt = now
-        feed.buffer.enqueue(protected, at: now, delay: delay)
+        feed.playback.publish(protected, at: now, delay: delay)
         feed.tick(at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func hold(displayID: UInt32? = nil) {
+        precondition(Thread.isMainThread)
+        if let displayID { windows[displayID]?.hold() }
+        else { windows.values.forEach { $0.hold() } }
     }
 
     func clear(displayID: UInt32? = nil) {

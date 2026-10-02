@@ -23,10 +23,9 @@ final class VeilController {
     private var rescanWork: DispatchWorkItem?
     private var scrollMonitor: Any?
     private var localScrollMonitor: Any?
-    private var scrollProtection = ScrollProtection()
-    private var scanFailures = ScanFailures()
+    private var contentChanges = ContentChanges()
+    private var captureErrors: [CGDirectDisplayID: String] = [:]
     private var visibleWindows: [ScreenWindow] = []
-    private var displayBounds: [CGRect] = []
     private(set) var notice: String?
     init() {
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -126,16 +125,11 @@ final class VeilController {
         session.start()
         accessibility.onMasks = { [weak self] masks, startedAt in
             guard let self, self.armed else { return }
-            self.textMasks = masks.filter { self.scrollProtection.accepts(windowID: $0.windowID, timestamp: startedAt) }
-        }
-        accessibility.onScanCompleted = { [weak self] ids, startedAt in
-            guard let self, self.armed, !self.store.current.ocr, !self.feedMode else { return }
-            self.scrollProtection.accessibilityScanned(windowIDs: ids, startedAt: startedAt)
-            self.refreshMasks()
+            self.textMasks = masks.filter { self.contentChanges.accepts(windowID: $0.windowID, timestamp: startedAt) }
         }
         accessibility.onInvalidation = { [weak self] in self?.axDirty = true }
         accessibility.onContentInvalidation = { [weak self] ids in
-            self?.protectScrollingWindows(ids, at: ProcessInfo.processInfo.systemUptime)
+            self?.contentChanged(ids, at: ProcessInfo.processInfo.systemUptime)
         }
         accessibility.onPaths = { [weak self] found in
             guard let self, self.armed else { return }
@@ -152,9 +146,6 @@ final class VeilController {
         let revision = sessionGeneration
         let capture = ScreenCapture(engine: ocrEngine)
         self.capture = capture
-        displayBounds = NSScreen.screens.compactMap {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDisplayBounds($0.uint32Value) }
-        }
         scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in self?.scrolled(event) }
         localScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             self?.scrolled(event)
@@ -167,16 +158,34 @@ final class VeilController {
             guard let self, self.armed, self.sessionGeneration == revision else { return }
             self.scanned(frame, fresh: masks)
         }
+        capture.onTrackedMasks = { [weak self] displayID, masks, timestamp, windows in
+            guard let self, self.armed, !self.feedMode, self.sessionGeneration == revision,
+                  windows == self.scene else { return }
+            let old = self.ocrMasks[displayID] ?? []
+            let ids = Set((old + masks).map(\.windowID))
+            let moved = ids.filter { id in
+                let before = old.filter { $0.windowID == id }
+                let after = masks.filter { $0.windowID == id }
+                return before.count != after.count || before.contains { first in
+                    !after.contains { $0.rule == first.rule && $0.hash == first.hash && $0.rect == first.rect }
+                }
+            }
+            for id in moved { self.contentChanges.changed(windowID: id, at: timestamp) }
+            self.textMasks.removeAll { moved.contains($0.windowID) }
+            if !moved.isEmpty {
+                self.accessibility.invalidateContent(windowIDs: moved)
+                self.axDirty = true
+            }
+            self.tracker.invalidate(windowIDs: ids)
+            self.ocrMasks[displayID] = masks
+            self.refreshMasks()
+        }
         capture.onFailure = { [weak self] message, displayID in
             guard let self, self.armed, self.sessionGeneration == revision else { return }
-            self.error = message
-            let ids = displayID.map { [$0] } ?? NSScreen.screens.compactMap {
-                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-            }
-            for id in ids { self.scanFailures.failed(displayID: id, at: ProcessInfo.processInfo.systemUptime) }
+            self.captureErrors[displayID ?? 0] = message
+            self.error = self.captureErrors.sorted { $0.key < $1.key }.first?.value
             self.capture.requestFullScan()
-            self.feed.clear(displayID: displayID)
-            self.refreshMasks()
+            self.feed.hold(displayID: displayID)
             self.changed?()
         }
         captureTask = Task { @MainActor [weak self] in
@@ -219,10 +228,9 @@ final class VeilController {
         if let localScrollMonitor { NSEvent.removeMonitor(localScrollMonitor) }
         scrollMonitor = nil
         localScrollMonitor = nil
-        scrollProtection.reset()
-        scanFailures.reset()
+        contentChanges.reset()
+        captureErrors.removeAll()
         visibleWindows.removeAll()
-        displayBounds.removeAll()
         manualSession = false
         setPeek(false)
         accessibility.stop()
@@ -248,22 +256,22 @@ final class VeilController {
               !store.current.allowedPaths.contains(path(for: window)) else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let timestamp = event.timestamp.isFinite && event.timestamp <= now && now - event.timestamp < 2 ? event.timestamp : now
-        protectScrollingWindows([window.id], at: timestamp)
+        contentChanged([window.id], at: timestamp)
     }
 
-    private func protectScrollingWindows(_ ids: Set<CGWindowID>, at timestamp: TimeInterval) {
+    private func contentChanged(_ ids: Set<CGWindowID>, at timestamp: TimeInterval) {
         guard armed else { return }
         let affected = visibleWindows.filter { ids.contains($0.id) && !store.current.allowedPaths.contains(path(for: $0)) }
         guard !affected.isEmpty else { return }
         let ids = Set(affected.map(\.id))
         for window in affected {
-            scrollProtection.scrolled(windowID: window.id, at: timestamp)
+            contentChanges.changed(windowID: window.id, at: timestamp)
             accessibility.prioritize(pid: window.pid)
         }
         tracker.invalidate(windowIDs: ids)
         accessibility.invalidateContent(windowIDs: ids)
         textMasks.removeAll { ids.contains($0.windowID) }
-        for id in Array(ocrMasks.keys) { ocrMasks[id]?.removeAll { ids.contains($0.windowID) } }
+        if feedMode { feed.hold() }
         capture.requestFullScan()
         scheduleRescan()
         refreshMasks()
@@ -276,23 +284,17 @@ final class VeilController {
         updateScene(windows)
         guard frame.windows == scene, sceneStableSince <= frame.timestamp else {
             capture.requestFullScan()
-            if feedMode { feed.clear(displayID: frame.displayID) }
+            if feedMode { feed.hold(displayID: frame.displayID) }
             return
         }
-        let fresh = fresh.filter { scrollProtection.accepts(windowID: $0.windowID, timestamp: frame.timestamp) }
-        ocrMasks[frame.displayID] = (ocrMasks[frame.displayID] ?? []).filter { !$0.rect.intersects(frame.scannedBounds) } + fresh
-        scrollProtection.scanned(bounds: frame.scannedBounds, timestamp: frame.timestamp)
-        if scanFailures.scanned(displayID: frame.displayID, displayBounds: frame.displayBounds,
-                                scannedBounds: frame.scannedBounds, timestamp: frame.timestamp), scanFailures.since.isEmpty {
-            error = nil
-        }
+        captureErrors.removeValue(forKey: frame.displayID)
+        error = captureErrors.sorted { $0.key < $1.key }.first?.value
+        if feedMode { ocrMasks[frame.displayID] = fresh }
         refreshMasks()
         if feedMode {
             let windowMasks = windows.filter { windowRule(for: $0) != nil }
                 .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
-            let staleWindows = windows.filter { !scrollProtection.accepts(windowID: $0.id, timestamp: frame.timestamp) }
-                .map { Mask(rect: $0.bounds, rule: "scrolling-text", app: $0.app, windowID: $0.id) }
-            let current = (fresh + windowMasks + textMasks + scrollMasks() + staleWindows + failureMasks()).filter { permitted($0, in: windows) }
+            let current = (fresh + windowMasks).filter { permitted($0, in: windows) }
             let sx = Double(frame.image.width) / frame.displayBounds.width
             let sy = Double(frame.image.height) / frame.displayBounds.height
             let rects = current.compactMap { mask -> CGRect? in
@@ -314,37 +316,25 @@ final class VeilController {
             if self.store.current.ocr || self.feedMode { self.capture.rescanNow() }
         }
         rescanWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + scrollProtection.settleInterval + 0.02, execute: work)
-    }
-
-    private func scrollMasks() -> [Mask] {
-        visibleWindows.filter { scrollProtection.windowIDs.contains($0.id) }.flatMap { window in
-            window.visibleParts(of: window.bounds, in: visibleWindows).map {
-                Mask(rect: $0, rule: "scrolling-text", app: window.app, windowID: window.id)
-            }
-        }
-    }
-
-    private func failureMasks() -> [Mask] {
-        scanFailures.since.keys.map { Mask(rect: CGDisplayBounds($0), rule: "detector-error", app: "screen") }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)
     }
 
     private func refreshMasks() {
         guard armed else { return }
-        let released = scrollProtection.update(windows: visibleWindows, displays: displayBounds,
-                                               now: ProcessInfo.processInfo.systemUptime)
-        tracker.invalidate(windowIDs: released)
-        if store.current.ocr || feedMode { textMasks.removeAll { released.contains($0.windowID) } }
         let current = visibleWindows.flatMap { window -> [Mask] in
             guard let rule = windowRule(for: window) else { return [] }
             return window.visibleParts(of: window.bounds, in: visibleWindows).map {
                 Mask(rect: $0, rule: rule.id, app: window.app, windowID: window.id)
             }
         }
-        let detected = (current + textMasks + ocrMasks.values.flatMap { $0 }).filter { permitted($0, in: visibleWindows) }
+        let tracked = ocrMasks.values.flatMap { $0 }
+        let accessible = textMasks.filter { mask in
+            !tracked.contains { $0.windowID == mask.windowID && $0.rule == mask.rule &&
+                !$0.hash.isEmpty && $0.hash == mask.hash && $0.rect.intersects(mask.rect) }
+        }
+        let detected = (current + accessible + tracked).filter { permitted($0, in: visibleWindows) }
         masks = tracker.update(detected, windows: visibleWindows)
         session.record(masks)
-        masks += scrollMasks() + failureMasks()
         if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
     }
 
@@ -375,6 +365,7 @@ final class VeilController {
         let windows = ScreenWindow.visible()
         updateScene(windows)
         visibleWindows = windows
+        contentChanges.retain(windowIDs: Set(windows.map(\.id)))
         paths = paths.filter { id, value in windows.contains { $0.id == id && $0.title.hashValue == value.title } }
         capture.updatePaths(paths)
         let now = ProcessInfo.processInfo.systemUptime

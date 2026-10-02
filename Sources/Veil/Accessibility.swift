@@ -79,11 +79,8 @@ final class AccessibilityReader {
     private var generation = 0
     private var observers: [pid_t: AXWatch] = [:]
     private var invalidation: DispatchWorkItem?
-    private var stabilityCheck: DispatchWorkItem?
-    private var previousAreas: [AreaID: AreaState] = [:]
     private var cachedMasks: [AreaID: [Mask]] = [:]
     private var cachedMaskCount = 0
-    private var overflowWindows: Set<CGWindowID> = []
     private var scanOffset = 0
     private var priorityPID: pid_t?
 
@@ -96,12 +93,6 @@ final class AccessibilityReader {
     private struct AreaID: Hashable {
         let window: CGWindowID
         let element: UInt
-    }
-    private struct AreaState {
-        let signature: Int
-        let changedAt: TimeInterval
-        let seenAt: TimeInterval
-        let hadSecret: Bool
     }
     private struct TextSlice {
         let text: String
@@ -123,16 +114,12 @@ final class AccessibilityReader {
         lock.unlock()
         invalidation?.cancel()
         invalidation = nil
-        stabilityCheck?.cancel()
-        stabilityCheck = nil
         priorityPID = nil
         observers.values.forEach { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource($0.observer), .commonModes) }
         observers.removeAll()
         queue.async { [weak self] in
-            self?.previousAreas.removeAll()
             self?.cachedMasks.removeAll()
             self?.cachedMaskCount = 0
-            self?.overflowWindows.removeAll()
         }
     }
 
@@ -140,8 +127,6 @@ final class AccessibilityReader {
         queue.async { [weak self] in
             guard let self else { return }
             self.cachedMasks = self.cachedMasks.filter { !windowIDs.contains($0.key.window) }
-            self.previousAreas = self.previousAreas.filter { !windowIDs.contains($0.key.window) }
-            self.overflowWindows.subtract(windowIDs)
             self.cachedMaskCount = self.cachedMasks.values.reduce(0) { $0 + $1.count }
         }
     }
@@ -172,7 +157,6 @@ final class AccessibilityReader {
             guard let self else { return }
             var paths: [CGWindowID: String] = [:]
             var targets: [WatchTarget] = []
-            var unstable = false
             var completedWindows: Set<CGWindowID> = []
             let startedAt = ProcessInfo.processInfo.systemUptime
             let deadline = startedAt + 0.18
@@ -233,55 +217,32 @@ final class AccessibilityReader {
                                 }
                                 catch {
                                     traversalComplete = false
-                                    self.storeMasks([Mask(rect: window.bounds, rule: "detector-error", app: window.app,
-                                                          windowID: window.id, anchor: window.bounds)], for: key)
-                                    continue
-                                }
-                                if trackLayout {
-                                    let now = ProcessInfo.processInfo.systemUptime
-                                    var fingerprint = Hasher()
-                                    fingerprint.combine(slice.text)
-                                    fingerprint.combine(slice.visibleRange?.location ?? -1)
-                                    fingerprint.combine(slice.visibleRange?.length ?? -1)
-                                    fingerprint.combine(Double(frame.minX - window.bounds.minX))
-                                    fingerprint.combine(Double(frame.minY - window.bounds.minY))
-                                    fingerprint.combine(Double(frame.width))
-                                    fingerprint.combine(Double(frame.height))
-                                    let signature = fingerprint.finalize()
-                                    let old = self.previousAreas[key]
-                                    let changed = old.map { $0.signature != signature } ?? false
-                                    let changedAt = changed ? now : old?.changedAt ?? -.infinity
-                                    let settling = now - changedAt < 0.25
-                                    self.previousAreas[key] = AreaState(signature: signature, changedAt: changedAt, seenAt: now,
-                                                                      hadSecret: !hits.isEmpty || (settling && old?.hadSecret == true))
-                                    if settling && (!hits.isEmpty || old?.hadSecret == true) {
-                                        unstable = true
-                                        let movingArea = textArea ? frame : window.bounds
-                                        elementMasks += window.visibleParts(of: movingArea, in: windows).map {
-                                            Mask(rect: $0, rule: "scrolling-text", app: window.app, windowID: window.id, anchor: window.bounds)
-                                        }
-                                    }
+                                    hits = []
                                 }
                                 for hit in hits {
                                     guard let range = Self.stringRange(hit.start..<hit.end, in: slice.text) else { continue }
                                     let local = NSRange(range, in: slice.text)
                                     var axRange = CFRange(location: local.location + slice.offset, length: local.length)
                                     var result: CFTypeRef?
-                                    var bounds = frame
+                                    var bounds: CGRect?
                                     if hit.rule == "private-key" {
                                         bounds = window.bounds
                                     } else if let value = AXValueCreate(.cfRange, &axRange),
                                               AXUIElementCopyParameterizedAttributeValue(element, kAXBoundsForRangeParameterizedAttribute as CFString, value, &result) == .success,
                                               let result, CFGetTypeID(result) == AXValueGetTypeID() {
                                         var exact = CGRect.zero
-                                        if AXValueGetValue(result as! AXValue, .cgRect, &exact), !exact.isEmpty, !exact.isNull {
-                                            bounds = exact
+                                        if AXValueGetValue(result as! AXValue, .cgRect, &exact) {
+                                            bounds = Self.rangeTextBounds(exact, text: String(slice.text[range]))
                                         }
                                     }
+                                    if bounds == nil {
+                                        bounds = Self.staticTextBounds(slice.text, match: local, role: role, frame: frame)
+                                    }
+                                    guard let bounds else { continue }
                                     let limit = hit.rule == "private-key" ? window.bounds : frame.intersection(window.bounds)
-                                    bounds = bounds.insetBy(dx: -4, dy: -4).intersection(limit)
-                                    if !bounds.isEmpty && !bounds.isNull {
-                                        elementMasks += window.visibleParts(of: bounds, in: windows).map {
+                                    let covered = bounds.insetBy(dx: -4, dy: -4).intersection(limit)
+                                    if !covered.isEmpty && !covered.isNull {
+                                        elementMasks += window.visibleParts(of: covered, in: windows).map {
                                             Mask(rect: $0, rule: hit.rule, app: window.app, hash: hit.hash, windowID: window.id, anchor: window.bounds)
                                         }
                                     }
@@ -291,15 +252,7 @@ final class AccessibilityReader {
                                 if role == kAXStaticTextRole || role == kAXTextAreaRole || role == kAXTextFieldRole {
                                     traversalComplete = false
                                 }
-                                if self.previousAreas[key]?.hadSecret == true || self.cachedMasks[key]?.isEmpty == false {
-                                    if let old = self.previousAreas[key] {
-                                        self.previousAreas[key] = AreaState(signature: old.signature, changedAt: old.changedAt,
-                                                                           seenAt: ProcessInfo.processInfo.systemUptime, hadSecret: true)
-                                    }
-                                    self.storeMasks(window.visibleParts(of: frame, in: windows).map {
-                                        Mask(rect: $0, rule: "unreadable-text", app: window.app, windowID: window.id, anchor: window.bounds)
-                                    }, for: key)
-                                }
+                                self.storeMasks([], for: key)
                             }
                         }
                         let children = axChildren(element)
@@ -311,18 +264,13 @@ final class AccessibilityReader {
                        self.currentGeneration() == revision {
                         self.cachedMasks = self.cachedMasks.filter { $0.key.window != window.id || seenAreas.contains($0.key) }
                         self.cachedMaskCount = self.cachedMasks.values.reduce(0) { $0 + $1.count }
-                        self.previousAreas = self.previousAreas.filter { $0.key.window != window.id || seenAreas.contains($0.key) }
                         if readText { completedWindows.insert(window.id) }
                     }
                 }
             }
-            let now = ProcessInfo.processInfo.systemUptime
             let ids = Set(windows.map(\.id))
-            self.previousAreas = self.previousAreas.filter { ids.contains($0.key.window) && now - $0.value.seenAt < 2 }
-            if self.previousAreas.count > 900 { self.previousAreas.removeAll() }
             self.cachedMasks = self.cachedMasks.filter { ids.contains($0.key.window) }
             self.cachedMaskCount = self.cachedMasks.values.reduce(0) { $0 + $1.count }
-            self.overflowWindows.formIntersection(ids)
             let masks = self.visibleMasks(windows: windows)
             let installed = self.installObservers(targets, existing: watched, generation: revision)
             DispatchQueue.main.async { [weak self] in
@@ -336,23 +284,17 @@ final class AccessibilityReader {
                 self.onMasks?(masks, startedAt)
                 self.onPaths?(paths)
                 self.onScanCompleted?(completedWindows, startedAt)
-                if unstable { self.scheduleStabilityCheck(generation: revision) }
             }
         }
     }
 
     private func storeMasks(_ masks: [Mask], for key: AreaID) {
-        guard !overflowWindows.contains(key.window) else { return }
         let previousCount = cachedMasks[key]?.count ?? 0
-        if cachedMaskCount - previousCount + masks.count > 4096 {
-            overflowWindows.insert(key.window)
-            cachedMasks = cachedMasks.filter { $0.key.window != key.window }
-            cachedMaskCount = cachedMasks.values.reduce(0) { $0 + $1.count }
-        } else {
-            if masks.isEmpty { cachedMasks.removeValue(forKey: key) }
-            else { cachedMasks[key] = masks }
-            cachedMaskCount += masks.count - previousCount
-        }
+        let capacity = max(0, 4096 - (cachedMaskCount - previousCount))
+        let kept = Array(masks.prefix(capacity))
+        if kept.isEmpty { cachedMasks.removeValue(forKey: key) }
+        else { cachedMasks[key] = kept }
+        cachedMaskCount += kept.count - previousCount
     }
 
     private func visibleMasks(windows: [ScreenWindow]) -> [Mask] {
@@ -363,6 +305,7 @@ final class AccessibilityReader {
                 var mask = original
                 if let anchor = mask.anchor {
                     if anchor.size != window.bounds.size {
+                        guard mask.rule == "private-key" else { continue }
                         mask.rect = window.bounds
                     } else {
                         mask.rect = mask.rect.offsetBy(dx: window.bounds.minX - anchor.minX, dy: window.bounds.minY - anchor.minY)
@@ -374,11 +317,6 @@ final class AccessibilityReader {
                     part.rect = rect
                     return part
                 }
-            }
-        }
-        for window in windows where overflowWindows.contains(window.id) {
-            result += window.visibleParts(of: window.bounds, in: windows).map {
-                Mask(rect: $0, rule: "scan-capacity", app: window.app, windowID: window.id, anchor: window.bounds)
             }
         }
         return result
@@ -439,22 +377,30 @@ final class AccessibilityReader {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: work)
     }
 
-    private func scheduleStabilityCheck(generation: Int) {
-        guard stabilityCheck == nil else { return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.stabilityCheck = nil
-            guard self.currentGeneration() == generation else { return }
-            self.onInvalidation?()
-        }
-        stabilityCheck = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: work)
-    }
-
     private func currentGeneration() -> Int {
         lock.lock()
         defer { lock.unlock() }
         return generation
+    }
+
+    static func rangeTextBounds(_ rect: CGRect, text: String) -> CGRect? {
+        guard !text.isEmpty, !text.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              !rect.isEmpty, !rect.isNull, rect.height <= 64,
+              [rect.minX, rect.minY, rect.width, rect.height].allSatisfy({ $0.isFinite }),
+              rect.width <= max(24, CGFloat(text.count) * rect.height * 1.2) else { return nil }
+        return rect
+    }
+
+    static func staticTextBounds(_ text: String, match: NSRange, role: String, frame: CGRect) -> CGRect? {
+        guard role == kAXStaticTextRole, let range = Range(match, in: text),
+              !text.unicodeScalars.contains(where: CharacterSet.newlines.contains),
+              !frame.isEmpty, !frame.isNull, frame.height <= 48,
+              [frame.minX, frame.minY, frame.width, frame.height].allSatisfy({ $0.isFinite }) else { return nil }
+        let line = text.trimmingCharacters(in: .whitespaces)
+        let hit = text[range].trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty, Double(hit.utf16.count) >= Double(line.utf16.count) * 0.75,
+              frame.width <= CGFloat(line.count) * frame.height else { return nil }
+        return frame
     }
 
     static func stringRange(_ bytes: Range<Int>, in text: String) -> Range<String.Index>? {
@@ -504,7 +450,6 @@ final class AccessibilityReader {
 
     deinit {
         invalidation?.cancel()
-        stabilityCheck?.cancel()
         let watches = Array(observers.values)
         let remove = {
             for watch in watches { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(watch.observer), .commonModes) }

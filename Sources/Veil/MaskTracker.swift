@@ -14,9 +14,9 @@ final class MaskTracker {
             guard let window = windows.first(where: { $0.id == original.windowID }) else { return nil }
             var mask = original
             if let anchor = original.anchor {
-                mask.rect = anchor.size == window.bounds.size
-                    ? mask.rect.offsetBy(dx: window.bounds.minX - anchor.minX, dy: window.bounds.minY - anchor.minY)
-                    : window.bounds
+                guard anchor.size == window.bounds.size || mask.rule == "private-key" else { return nil }
+                mask.rect = mask.rule == "private-key" ? window.bounds :
+                    mask.rect.offsetBy(dx: window.bounds.minX - anchor.minX, dy: window.bounds.minY - anchor.minY)
             }
             mask.anchor = window.bounds
             return mask
@@ -27,9 +27,9 @@ final class MaskTracker {
             if entry.mask.windowID != 0 {
                 guard let window = windows.first(where: { $0.id == entry.mask.windowID }) else { return nil }
                 if let old = entry.windowBounds {
-                    next.mask.rect = old.size == window.bounds.size
-                        ? next.mask.rect.offsetBy(dx: window.bounds.minX - old.minX, dy: window.bounds.minY - old.minY)
-                        : window.bounds
+                    guard old.size == window.bounds.size || next.mask.rule == "private-key" else { return nil }
+                    next.mask.rect = next.mask.rule == "private-key" ? window.bounds :
+                        next.mask.rect.offsetBy(dx: window.bounds.minX - old.minX, dy: window.bounds.minY - old.minY)
                 }
                 next.windowBounds = window.bounds
             }

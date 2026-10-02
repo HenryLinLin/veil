@@ -29,7 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !UserDefaults.standard.bool(forKey: "setupSeen") { onboarding.show() }
     }
     private func refresh(force: Bool = false) {
-        let state = controller.armed ? (controller.masks.isEmpty ? "Armed" : "Masking") : "Off"
+        let state = controller.armed ? (controller.error != nil ? "Scan error" : (controller.masks.isEmpty ? "Armed" : "Masking")) : "Off"
         let view = "\(state)|\(controller.feedMode)|\(controller.peeking)|\(controller.error ?? "")|\(controller.notice ?? "")|\(hotkeys.error ?? "")|\(controller.masks.map { $0.rule + $0.hash }.sorted())"
         guard force || view != lastView else { return }
         let symbol = NSImage(systemSymbolName: controller.armed ? "shield.fill" : "shield", accessibilityDescription: "Veil · \(state)")
