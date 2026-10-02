@@ -68,6 +68,8 @@ enum FeedChecks {
         full.clear()
         try check(full.canAccept(at: 0), "Clear retained stale admission timestamps")
         results.append("delay deadlines, adaptive admission, queue bounds and resets")
+        try holdChecks()
+        results.append("held playback, discarded pending frames, delayed recovery and explicit reset")
 
         let old = try JSONDecoder().decode(Preferences.self, from: Data(#"{"emails":true}"#.utf8))
         try check(old.emails && old.known && old.generic && old.personal && old.ocr,
@@ -101,6 +103,60 @@ enum FeedChecks {
         try renderingChecks(compositor)
         results.append("Metal opacity, padding, mask orientation and output dimensions")
         return results
+    }
+
+    private static func holdChecks() throws {
+        let first = sample()
+        let pending = sample()
+        let resumed = sample()
+        var playback = FeedPlayback()
+        try check(playback.publish(first, at: 0, delay: 0.5), "Initial protected frame rejected")
+        playback.tick(at: 0.5)
+        try check(playback.image === first, "Initial protected frame was not displayed")
+        try check(playback.publish(pending, at: 0.6, delay: 0.5), "Pending protected frame rejected")
+        try check(playback.pendingCount == 1 && playback.image === first,
+                  "A pending delayed frame replaced the displayed image early")
+        playback.hold()
+        try check(playback.pendingCount == 0 && playback.isHeld && playback.image === first,
+                  "Hold did not discard pending frames while retaining the displayed image")
+        playback.tick(at: 100)
+        try check(playback.image === first && playback.isHeld,
+                  "Stale-input expiry erased an explicitly held protected frame")
+        playback.hold()
+        try check(playback.image === first && playback.pendingCount == 0, "Repeated hold changed the displayed frame")
+        try check(playback.publish(resumed, at: 100, delay: 0.5), "Verified frame could not resume held playback")
+        try check(!playback.isHeld && playback.image === first && playback.pendingCount == 1,
+                  "Resuming did not preserve the frozen frame during the new delay")
+        playback.tick(at: 100.499)
+        try check(playback.image === first, "Recovery shortened the configured delay")
+        playback.tick(at: 100.5)
+        try check(playback.image === resumed && playback.image !== pending,
+                  "Recovery displayed a discarded pending frame")
+        playback.clear()
+        try check(playback.image == nil && playback.pendingCount == 0 && !playback.isHeld,
+                  "Explicit clear retained held playback state")
+
+        var waiting = FeedPlayback()
+        _ = waiting.publish(first, at: 0, delay: 0.5)
+        waiting.hold()
+        waiting.tick(at: 100)
+        try check(waiting.image == nil && waiting.pendingCount == 0 && waiting.isHeld,
+                  "Holding before first display exposed a pending frame")
+        _ = waiting.publish(resumed, at: 101, delay: 0)
+        try check(waiting.image === resumed && !waiting.isHeld,
+                  "Zero-delay verified recovery did not display immediately")
+
+        var idle = FeedPlayback()
+        idle.tick(at: 0)
+        try check(idle.image == nil && !idle.isHeld, "An empty new feed incorrectly began paused")
+        _ = idle.publish(first, at: 0, delay: 0)
+        idle.tick(at: 2.01)
+        try check(idle.isHeld && idle.image === first && idle.pendingCount == 0,
+                  "Idle input erased the last protected image instead of holding it")
+        idle.tick(at: 100)
+        try check(idle.image === first, "A long idle interval erased the held image")
+        _ = idle.publish(resumed, at: 100, delay: 0)
+        try check(!idle.isHeld && idle.image === resumed, "Verified input did not resume an idle feed")
     }
 
     private static func renderingChecks(_ compositor: FeedCompositor) throws {

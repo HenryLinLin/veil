@@ -37,8 +37,8 @@ enum NativeTests {
         partialOverlapHold()
         sameIdentityCoverage()
         invalidateScrolledWindows()
-        scrollProtectionChecks()
-        scanFailureChecks()
+        contentChangeChecks()
+        resizingStaysLocal()
         print("\(checks) native geometry and tracking checks passed")
     }
 
@@ -175,118 +175,35 @@ enum NativeTests {
         expect(tracker.update([], windows: owners, now: 50.4).isEmpty, "unowned masks can be explicitly invalidated")
     }
 
-    static func scrollProtectionChecks() {
-        let owner = window()
-        let display = CGRect(x: 0, y: 0, width: 1000, height: 700)
-        var protection = ScrollProtection()
-        protection.scrolled(windowID: owner.id, at: 10)
-        protection.scrolled(windowID: owner.id, at: 10.02)
-        protection.scanned(bounds: display, timestamp: 10.13)
-        expect(protection.update(windows: [owner], displays: [display], now: 10.2).isEmpty,
-               "closely spaced scroll events each restart the quiet interval")
-        expect(!protection.accepts(windowID: owner.id, timestamp: 10.13),
-               "high-frequency scrolling advances the frame eligibility cutoff")
-        protection.scanned(bounds: display, timestamp: 10.15)
-        expect(protection.update(windows: [owner], displays: [display], now: 10.2) == [owner.id],
-               "a scan after the final high-frequency event's quiet interval releases")
-        protection.reset()
-        protection.scrolled(windowID: owner.id, at: 60)
-        protection.scanned(bounds: display, timestamp: 59.9)
-        expect(protection.update(windows: [owner], displays: [display], now: 60.3).isEmpty,
-               "an OCR frame from before scrolling cannot release the guard")
-        expect(protection.windowIDs == [owner.id], "an old scan leaves the window guarded")
-        expect(!protection.accepts(windowID: owner.id, timestamp: 59.9), "old frame geometry is not accepted while guarded")
-
-        protection.reset()
-        protection.scrolled(windowID: owner.id, at: 70)
-        protection.scanned(bounds: display, timestamp: 70.01)
-        expect(protection.update(windows: [owner], displays: [display], now: 70.11).isEmpty,
-               "the quiet interval is required even after a complete scan")
-        expect(protection.update(windows: [owner], displays: [display], now: 70.3).isEmpty,
-               "waiting after an in-motion frame does not make its old coverage settled")
-        protection.scanned(bounds: display, timestamp: 70.13)
-        expect(protection.update(windows: [owner], displays: [display], now: 70.3) == [owner.id],
-               "a full scan captured after the quiet interval releases the window")
-
-        protection.scrolled(windowID: owner.id, at: 80)
-        protection.scanned(bounds: display, timestamp: 80.13)
-        expect(protection.update(windows: [owner], displays: [display], now: 80.14) == [owner.id],
-               "a stable scanned window initially releases")
-        protection.scrolled(windowID: owner.id, at: 80.2)
-        protection.scanned(bounds: display, timestamp: 80.13)
-        expect(protection.update(windows: [owner], displays: [display], now: 80.5).isEmpty,
-               "renewed scrolling invalidates previously verified coverage")
-        protection.scrolled(windowID: owner.id, at: 80.1)
-        expect(!protection.accepts(windowID: owner.id, timestamp: 80.15),
-               "an out-of-order scroll event cannot move the content cutoff backwards")
-        protection.scanned(bounds: display, timestamp: 80.33)
-        expect(protection.update(windows: [owner], displays: [display], now: 80.5) == [owner.id],
-               "the renewed scroll requires its own post-quiet scan")
-
-        let straddling = window(1, CGRect(x: 50, y: 0, width: 100, height: 100))
-        let screens = [CGRect(x: 0, y: 0, width: 100, height: 100),
-                       CGRect(x: 100, y: 0, width: 100, height: 100)]
-        protection.reset()
-        protection.scrolled(windowID: straddling.id, at: 90)
-        protection.scanned(bounds: screens[0], timestamp: 90.13)
-        expect(protection.update(windows: [straddling], displays: screens, now: 90.3).isEmpty,
-               "scanning one display does not release a window spanning two displays")
-        protection.scanned(bounds: CGRect(x: 101, y: 0, width: 99, height: 100), timestamp: 90.14)
-        expect(protection.update(windows: [straddling], displays: screens, now: 90.3).isEmpty,
-               "partial multi-display coverage cannot leave an unverified strip")
-        protection.scanned(bounds: CGRect(x: 100, y: 0, width: 1, height: 100), timestamp: 90.15)
-        expect(protection.update(windows: [straddling], displays: screens, now: 90.3) == [straddling.id],
-               "the union of post-quiet display scans must cover the whole visible window")
-
-        protection.reset()
-        protection.scrolled(windowID: owner.id, at: 100)
-        protection.accessibilityScanned(windowIDs: [owner.id], startedAt: 99.9)
-        expect(protection.update(windows: [owner], displays: [display], now: 100.3).isEmpty,
-               "an AX scan begun before scrolling cannot release the guard")
-        protection.accessibilityScanned(windowIDs: [owner.id], startedAt: 100.01)
-        expect(protection.update(windows: [owner], displays: [display], now: 100.3).isEmpty,
-               "an AX scan begun during the quiet interval cannot certify settled content")
-        protection.accessibilityScanned(windowIDs: [owner.id], startedAt: 100.13)
-        expect(protection.update(windows: [owner], displays: [display], now: 100.3) == [owner.id],
-               "a completed AX scan begun after the quiet interval releases AX-only protection")
-
-        protection.scrolled(windowID: owner.id, at: 110)
-        expect(protection.update(windows: [], displays: [display], now: 110.01) == [owner.id],
-               "closed windows immediately drop their pending guards")
-        expect(protection.windowIDs.isEmpty, "closed windows do not leave stuck guards")
-        expect(protection.accepts(windowID: owner.id, timestamp: 109),
-               "closing a window forgets its cutoff before an ID is reused")
-
-        protection.scrolled(windowID: owner.id, at: 120)
-        protection.scanned(bounds: display, timestamp: 120.13)
-        _ = protection.update(windows: [owner], displays: [display], now: 120.3)
-        expect(!protection.accepts(windowID: owner.id, timestamp: 119.9),
-               "releasing a guard does not make delayed pre-scroll frames eligible")
-        expect(!protection.accepts(windowID: owner.id, timestamp: 120.01),
-               "releasing a guard does not make delayed in-motion frames eligible")
-        expect(protection.accepts(windowID: owner.id, timestamp: 120.13),
-               "post-scroll frames remain eligible after release")
-        expect(protection.accepts(windowID: 2, timestamp: 119.9),
-               "scrolling one window does not invalidate unrelated window content")
-        protection.reset()
-        expect(protection.windowIDs.isEmpty && protection.accepts(windowID: owner.id, timestamp: 119.9),
-               "reset clears both guards and historical content cutoffs")
+    static func contentChangeChecks() {
+        var changes = ContentChanges()
+        changes.changed(windowID: 1, at: 10)
+        expect(!changes.accepts(windowID: 1, timestamp: 9), "old accessibility rectangles cannot be reused after scrolling")
+        expect(changes.accepts(windowID: 1, timestamp: 10.01), "fresh detections are usable during continuous scrolling")
+        expect(changes.accepts(windowID: 2, timestamp: 9), "unrelated windows keep their detections")
+        changes.changed(windowID: 1, at: 8)
+        expect(!changes.accepts(windowID: 1, timestamp: 9), "out-of-order events cannot restore stale rectangles")
+        changes.retain(windowIDs: [])
+        expect(changes.accepts(windowID: 1, timestamp: 9), "closing a window resets reused IDs")
+        changes.changed(windowID: 1, at: 12)
+        changes.reset()
+        expect(changes.accepts(windowID: 1, timestamp: 9), "stopping clears content epochs")
     }
-    static func scanFailureChecks() {
-        var failures = ScanFailures()
-        let display = CGRect(x: -400, y: 0, width: 400, height: 300)
-        failures.failed(displayID: 1, at: 10)
-        failures.failed(displayID: 2, at: 10)
-        expect(!failures.scanned(displayID: 1, displayBounds: display, scannedBounds: display, timestamp: 9), "old full scans cannot clear a later detector failure")
-        expect(!failures.scanned(displayID: 1, displayBounds: display, scannedBounds: CGRect(x: -400, y: 0, width: 400, height: 100), timestamp: 11), "partial OCR bands cannot uncover a failed display")
-        expect(!failures.scanned(displayID: 1, displayBounds: display, scannedBounds: .null, timestamp: 11), "empty OCR work cannot clear failure coverage")
-        expect(failures.scanned(displayID: 1, displayBounds: display, scannedBounds: display, timestamp: 11), "new full scans restore a protected display")
-        expect(failures.since[1] == nil && failures.since[2] != nil, "one recovered display cannot clear another display's failure")
-        failures.failed(displayID: 2, at: 12)
-        failures.failed(displayID: 2, at: 9)
-        expect(!failures.scanned(displayID: 2, displayBounds: display, scannedBounds: display, timestamp: 11), "late failures cannot move the recovery boundary backward")
-        failures.reset()
-        expect(failures.since.isEmpty, "stopping clears failure coverage")
+    static func resizingStaysLocal() {
+        let tracker = MaskTracker()
+        let original = window()
+        let resized = window(1, CGRect(x: 0, y: 0, width: 600, height: 500))
+        var token = mask(CGRect(x: 20, y: 30, width: 100, height: 20))
+        token.anchor = original.bounds
+        _ = tracker.update([token], windows: [original], now: 1)
+        expect(tracker.update([], windows: [resized], now: 1.1).isEmpty,
+               "window resizing never expands a held text mask into a blanket")
+        expect(tracker.update([token], windows: [resized], now: 1.2).isEmpty,
+               "cached text geometry cannot become a whole-window mask after resizing")
+        token.anchor = resized.bounds
+        let refreshed = tracker.update([token], windows: [resized], now: 1.3)
+        expect(refreshed.count == 1 && refreshed[0].rect == token.rect,
+               "a new localized scan restores the small mask after resizing")
     }
 
 }

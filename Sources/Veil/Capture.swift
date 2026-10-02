@@ -73,11 +73,13 @@ private struct RetainedFrame: @unchecked Sendable {
 
 final class ScreenCapture {
     var onScannedFrame: ((CapturedFrame, [Mask]) -> Void)?
+    var onTrackedMasks: ((CGDirectDisplayID, [Mask], TimeInterval, [WindowSignature]) -> Void)?
     var onFailure: ((String, CGDirectDisplayID?) -> Void)?
 
     private let lock = NSLock()
     private let captureQueue = DispatchQueue(label: "veil.capture", qos: .userInitiated)
     private let scanQueue = DispatchQueue(label: "veil.ocr", qos: .userInitiated)
+    private let trackingQueue = DispatchQueue(label: "veil.tracking", qos: .userInteractive)
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let engine: CoreEngine?
     private let maximumDimension: Int
@@ -96,7 +98,13 @@ final class ScreenCapture {
     private var screenshotInFlight: Set<CGDirectDisplayID> = []
     private var screenshotRetry: Set<CGDirectDisplayID> = []
     private var paths: [CGWindowID: (title: Int, path: String)] = [:]
-    private var cache: [CGDirectDisplayID: ScanCache] = [:]
+    private var pendingTracking: [CGDirectDisplayID: RetainedFrame] = [:]
+    private var latestTrackingInput: [CGDirectDisplayID: RetainedFrame] = [:]
+    private var trackingInFlight: Set<CGDirectDisplayID> = []
+    private var trackingStates: [CGDirectDisplayID: TrackingState] = [:]
+    private var trackedDeliveries: [CGDirectDisplayID: TrackedDelivery] = [:]
+    private var trackingDeliveryScheduled = false
+    private var deliveredTrackingTime: [CGDirectDisplayID: TimeInterval] = [:]
     private var activeRequest: VNRecognizeTextRequest?
 
     private struct CaptureSource {
@@ -105,13 +113,35 @@ final class ScreenCapture {
         let bounds: CGRect
     }
 
-    private struct ScanCache {
-        let generation: Int
-        let revision: Int
-        let imageSize: CGSize
+    private struct GraySnapshot {
+        let frame: GrayFrame
+        let bounds: CGRect
+        let timestamp: TimeInterval
+        let windows: [WindowSignature]
     }
 
-    init(engine: CoreEngine? = nil, maximumDimension: Int = 2560, fps: Int = 8) {
+    private final class TrackingState {
+        let generation: Int
+        let revision: Int
+        let tracker = TextMaskTracker()
+        var latest: GraySnapshot?
+        var masks: [Int: Mask] = [:]
+        var fixedMasks: [Mask] = []
+        var seedWindows: [WindowSignature] = []
+        var seededAt: TimeInterval = -.infinity
+        init(generation: Int, revision: Int) {
+            self.generation = generation
+            self.revision = revision
+        }
+    }
+
+    private struct TrackedDelivery {
+        let masks: [Mask]
+        let timestamp: TimeInterval
+        let windows: [WindowSignature]
+    }
+
+    init(engine: CoreEngine? = nil, maximumDimension: Int = 2560, fps: Int = 30) {
         self.engine = engine
         self.maximumDimension = max(640, maximumDimension)
         self.fps = max(1, min(30, fps))
@@ -177,6 +207,12 @@ final class ScreenCapture {
             self.fullFrameScanning = fullFrameScanning
             revision += 1
             pending.removeAll()
+            pendingTracking.removeAll()
+            latestTrackingInput.removeAll()
+            trackingInFlight.removeAll()
+            trackedDeliveries.removeAll()
+            trackingDeliveryScheduled = false
+            deliveredTrackingTime.removeAll()
             screenshotRetry.formUnion(screenshotInFlight)
             needsFullScan.formUnion(streams.map { $0.1.displayID })
             return activeRequest
@@ -227,7 +263,7 @@ final class ScreenCapture {
             defer { self.finishScreenshot(displayID, token: token) }
             guard self.isActive(token, revision: revision) else { return }
             guard let image, error == nil else {
-                self.report("Could not capture a fresh frame. Protection remains in place.", token: token, revision: revision, displayID: displayID)
+                self.report("Scanning paused. Restart presenting to retry.", token: token, revision: revision, displayID: displayID)
                 return
             }
             let retained = RetainedFrame(content: .image(image), displayID: displayID, displayBounds: source.bounds,
@@ -256,6 +292,12 @@ final class ScreenCapture {
             needsFullScan.removeAll()
             pending.removeAll()
             latestFrameTime.removeAll()
+            pendingTracking.removeAll()
+            latestTrackingInput.removeAll()
+            trackingInFlight.removeAll()
+            trackedDeliveries.removeAll()
+            trackingDeliveryScheduled = false
+            deliveredTrackingTime.removeAll()
             captureSources.removeAll()
             screenshotInFlight.removeAll()
             screenshotRetry.removeAll()
@@ -272,8 +314,10 @@ final class ScreenCapture {
             }
         }
         scanQueue.async { [weak self] in
-            self?.cache.removeAll()
             self?.context.clearCaches()
+        }
+        trackingQueue.async { [weak self] in
+            self?.trackingStates.removeAll()
         }
     }
 
@@ -302,6 +346,7 @@ final class ScreenCapture {
     }
 
     private func enqueue(_ retained: RetainedFrame, token: Int, fullScan: Bool = false) {
+        enqueueTracking(retained, token: token)
         let displayID = retained.displayID
         let work = locked { () -> (RetainedFrame, (Bool, Bool, Int, Bool))? in
             guard running, generation == token, retained.revision == revision else { return nil }
@@ -342,19 +387,22 @@ final class ScreenCapture {
                     self.report("Could not read a captured frame.", token: token, revision: settings.2, displayID: displayID)
                     return
                 }
-                let size = CGSize(width: image.width, height: image.height)
                 do {
                     let result = try self.scan(image, displayID: displayID, displayBounds: displayBounds,
                                               dirty: retained.dirty, windows: retained.windows,
                                               token: token, settings: settings)
                     guard self.isActive(token, revision: settings.2) else { return }
-                    self.cache[displayID] = ScanCache(generation: token, revision: settings.2, imageSize: size)
                     let signatures = retained.windows.map {
                         WindowSignature(id: $0.id, pid: $0.pid, bounds: $0.bounds, layer: $0.layer, title: $0.title.hashValue)
                     }
                     let frame = CapturedFrame(image: image, displayID: displayID, displayBounds: displayBounds,
                                               scannedBounds: result.scannedBounds, timestamp: retained.timestamp,
                                               windows: signatures)
+                    if settings.0, !settings.1, let gray = Self.grayFrame(retained.content) {
+                        self.seedTracking(result.masks, source: GraySnapshot(frame: gray, bounds: displayBounds,
+                                                                             timestamp: retained.timestamp, windows: signatures),
+                                          displayID: displayID, token: token, revision: settings.2)
+                    }
                     deliveryPending = true
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
@@ -365,7 +413,7 @@ final class ScreenCapture {
                 } catch {
                     self.locked { if self.generation == token { self.needsFullScan.insert(displayID) } }
                     if self.isActive(token, revision: settings.2) {
-                        self.report("Text scanning failed. Protection remains in place until scanning recovers.", token: token, revision: settings.2, displayID: displayID)
+                        self.report("Scanning paused. Restart presenting to retry.", token: token, revision: settings.2, displayID: displayID)
                     }
                 }
             }
@@ -379,19 +427,8 @@ final class ScreenCapture {
         guard let engine else { throw CaptureError.missingEngine }
         let imageSize = CGSize(width: image.width, height: image.height)
         let fullRect = CGRect(origin: .zero, size: imageSize)
-        let previous = cache[displayID]
-        let validCache = previous?.generation == token && previous?.revision == settings.2
-            && previous?.imageSize == imageSize
-        var crop = fullRect
+        let crop = fullRect
         var masks: [Mask] = []
-        if !settings.1, !settings.3, validCache, let dirty {
-            if dirty.isEmpty { return ([], .null) }
-            let changed = dirty.reduce(CGRect.null) { $0.union($1) }.intersection(fullRect)
-            if changed.isNull || changed.isEmpty { return ([], .null) }
-            // Full-width bands keep tokens intact when one character changes.
-            crop = CGRect(x: 0, y: max(0, changed.minY - 48), width: fullRect.width,
-                          height: min(fullRect.maxY, changed.maxY + 48) - max(0, changed.minY - 48)).integral
-        }
         guard let cropped = image.cropping(to: crop) else { throw CaptureError.invalidCrop }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
@@ -436,6 +473,228 @@ final class ScreenCapture {
                              width: displayBounds.width,
                              height: crop.height / fullRect.height * displayBounds.height)
         return (masks, scanned)
+    }
+
+    private func enqueueTracking(_ retained: RetainedFrame, token: Int) {
+        let ready = locked { () -> Bool in
+            guard running, generation == token, revision == retained.revision, ocrEnabled, !fullFrameScanning else { return false }
+            if retained.timestamp >= (latestTrackingInput[retained.displayID]?.timestamp ?? -.infinity) {
+                latestTrackingInput[retained.displayID] = retained
+            }
+            if trackingInFlight.contains(retained.displayID) {
+                if retained.timestamp >= (pendingTracking[retained.displayID]?.timestamp ?? -.infinity) {
+                    pendingTracking[retained.displayID] = retained
+                }
+                return false
+            }
+            trackingInFlight.insert(retained.displayID)
+            return true
+        }
+        if ready { processTracking(retained, token: token) }
+    }
+
+    private func processTracking(_ retained: RetainedFrame, token: Int) {
+        trackingQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.finishTracking(retained.displayID, token: token, revision: retained.revision) }
+            guard self.isActive(token, revision: retained.revision) else { return }
+            autoreleasepool {
+                let state = self.trackingState(retained.displayID, token: token, revision: retained.revision)
+                guard let snapshot = self.graySnapshot(retained) else {
+                    state.tracker.reset()
+                    state.masks.removeAll()
+                    state.fixedMasks.removeAll()
+                    let windows = retained.windows.map {
+                        WindowSignature(id: $0.id, pid: $0.pid, bounds: $0.bounds, layer: $0.layer, title: $0.title.hashValue)
+                    }
+                    self.publishTracked([], displayID: retained.displayID, timestamp: retained.timestamp,
+                                        windows: windows, token: token, revision: retained.revision)
+                    self.clearTrackingInput(retained.displayID, through: retained.timestamp, token: token, revision: retained.revision)
+                    return
+                }
+                self.clearTrackingInput(retained.displayID, through: snapshot.timestamp, token: token, revision: retained.revision)
+                guard snapshot.timestamp >= (state.latest?.timestamp ?? -.infinity) else { return }
+                state.latest = snapshot
+                self.deliverTracking(state, displayID: retained.displayID, token: token, revision: retained.revision)
+            }
+        }
+    }
+
+    private func clearTrackingInput(_ displayID: CGDirectDisplayID, through timestamp: TimeInterval, token: Int, revision: Int) {
+        locked {
+            guard running, generation == token, self.revision == revision else { return }
+            if let latest = latestTrackingInput[displayID], latest.timestamp <= timestamp {
+                latestTrackingInput.removeValue(forKey: displayID)
+            }
+        }
+    }
+
+    private func finishTracking(_ displayID: CGDirectDisplayID, token: Int, revision: Int) {
+        let next = locked { () -> RetainedFrame? in
+            guard running, generation == token, self.revision == revision else { return nil }
+            if let newest = pendingTracking.removeValue(forKey: displayID) { return newest }
+            trackingInFlight.remove(displayID)
+            return nil
+        }
+        if let next { processTracking(next, token: token) }
+    }
+
+    private func trackingState(_ displayID: CGDirectDisplayID, token: Int, revision: Int) -> TrackingState {
+        if let state = trackingStates[displayID], state.generation == token, state.revision == revision { return state }
+        let state = TrackingState(generation: token, revision: revision)
+        trackingStates[displayID] = state
+        return state
+    }
+
+    private func graySnapshot(_ retained: RetainedFrame) -> GraySnapshot? {
+        guard let gray = Self.grayFrame(retained.content) else { return nil }
+        let windows = retained.windows.map {
+            WindowSignature(id: $0.id, pid: $0.pid, bounds: $0.bounds, layer: $0.layer, title: $0.title.hashValue)
+        }
+        return GraySnapshot(frame: gray, bounds: retained.displayBounds, timestamp: retained.timestamp, windows: windows)
+    }
+
+    private static func grayFrame(_ content: FrameContent) -> GrayFrame? {
+        switch content {
+        case .image(let image): return grayscale(image)
+        case .buffer(let buffer): return grayscale(buffer)
+        }
+    }
+
+    static func grayscale(_ buffer: CVPixelBuffer, maximumDimension: Int = 1280) -> GrayFrame? {
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let sourceWidth = CVPixelBufferGetWidth(buffer), sourceHeight = CVPixelBufferGetHeight(buffer)
+        guard sourceWidth > 0, sourceHeight > 0 else { return nil }
+        let limit = max(1, min(1280, maximumDimension))
+        let scale = min(1, Double(limit) / Double(max(sourceWidth, sourceHeight)))
+        let width = max(1, Int(Double(sourceWidth) * scale)), height = max(1, Int(Double(sourceHeight) * scale))
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        let source = base.assumingMemoryBound(to: UInt8.self)
+        var bytes = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            let row = min(sourceHeight - 1, (2 * y + 1) * sourceHeight / (2 * height)) * stride
+            for x in 0..<width {
+                let pixel = row + min(sourceWidth - 1, (2 * x + 1) * sourceWidth / (2 * width)) * 4
+                bytes[y * width + x] = UInt8((54 * Int(source[pixel + 2]) + 183 * Int(source[pixel + 1]) + 19 * Int(source[pixel])) >> 8)
+            }
+        }
+        return GrayFrame(width: width, height: height, bytes: bytes)
+    }
+
+    static func grayscale(_ image: CGImage, maximumDimension: Int = 1280) -> GrayFrame? {
+        let limit = max(1, min(1280, maximumDimension))
+        let scale = min(1, Double(limit) / Double(max(image.width, image.height)))
+        let width = max(1, Int(Double(image.width) * scale))
+        let height = max(1, Int(Double(image.height) * scale))
+        var bytes = [UInt8](repeating: 0, count: width * height)
+        let rendered = bytes.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                          bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return rendered ? GrayFrame(width: width, height: height, bytes: bytes) : nil
+    }
+
+    private func seedTracking(_ masks: [Mask], source: GraySnapshot, displayID: CGDirectDisplayID, token: Int, revision: Int) {
+        trackingQueue.async { [weak self] in
+            guard let self, self.isActive(token, revision: revision) else { return }
+            autoreleasepool {
+                let state = self.trackingState(displayID, token: token, revision: revision)
+                guard source.timestamp >= state.seededAt else { return }
+                let pending = self.locked { self.latestTrackingInput[displayID] }
+                if let pending, pending.revision == revision,
+                   pending.timestamp > (state.latest?.timestamp ?? -.infinity), let latest = self.graySnapshot(pending) {
+                    state.latest = latest
+                    self.clearTrackingInput(displayID, through: latest.timestamp, token: token, revision: revision)
+                }
+                if source.timestamp > (state.latest?.timestamp ?? -.infinity) { state.latest = source }
+                state.seededAt = source.timestamp
+                state.seedWindows = source.windows
+                state.fixedMasks = masks.filter { $0.rule == "private-key" }
+                state.masks.removeAll(keepingCapacity: true)
+                var boxes: [TextTrackBox] = []
+                for (id, mask) in masks.filter({ $0.rule != "private-key" }).prefix(32).enumerated() {
+                    let rect = mask.rect.intersection(source.bounds)
+                    guard !rect.isEmpty, !rect.isNull else { continue }
+                    let pixels = CGRect(x: (rect.minX - source.bounds.minX) / source.bounds.width * CGFloat(source.frame.width),
+                                        y: (rect.minY - source.bounds.minY) / source.bounds.height * CGFloat(source.frame.height),
+                                        width: rect.width / source.bounds.width * CGFloat(source.frame.width),
+                                        height: rect.height / source.bounds.height * CGFloat(source.frame.height))
+                    state.masks[id] = mask
+                    boxes.append(TextTrackBox(id: id, rect: pixels))
+                }
+                state.tracker.seed(boxes: boxes, in: source.frame, at: source.timestamp)
+                self.deliverTracking(state, displayID: displayID, token: token, revision: revision)
+            }
+        }
+    }
+
+    private func deliverTracking(_ state: TrackingState, displayID: CGDirectDisplayID, token: Int, revision: Int) {
+        guard let latest = state.latest else { return }
+        let tracked = state.tracker.track(in: latest.frame, at: latest.timestamp)
+        var masks = tracked.compactMap { tracked -> Mask? in
+            guard var mask = state.masks[tracked.id] else { return nil }
+            mask.rect = CGRect(x: latest.bounds.minX + tracked.rect.minX / CGFloat(latest.frame.width) * latest.bounds.width,
+                               y: latest.bounds.minY + tracked.rect.minY / CGFloat(latest.frame.height) * latest.bounds.height,
+                               width: tracked.rect.width / CGFloat(latest.frame.width) * latest.bounds.width,
+                               height: tracked.rect.height / CGFloat(latest.frame.height) * latest.bounds.height).intersection(latest.bounds)
+            if mask.windowID != 0 {
+                guard let owner = latest.windows.first(where: { $0.id == mask.windowID }),
+                      let original = state.seedWindows.first(where: { $0.id == mask.windowID }),
+                      owner.pid == original.pid, owner.title == original.title else { return nil }
+                mask.rect = mask.rect.intersection(owner.bounds)
+                mask.anchor = owner.bounds
+            }
+            return mask.rect.isEmpty || mask.rect.isNull ? nil : mask
+        }
+        masks += state.fixedMasks.compactMap { original -> Mask? in
+            var mask = original
+            if mask.windowID != 0 {
+                guard let owner = latest.windows.first(where: { $0.id == mask.windowID }),
+                      let previous = state.seedWindows.first(where: { $0.id == mask.windowID }),
+                      owner.pid == previous.pid, owner.title == previous.title else { return nil }
+                mask.rect = owner.bounds.intersection(latest.bounds)
+                mask.anchor = owner.bounds
+            }
+            return mask.rect.isEmpty || mask.rect.isNull ? nil : mask
+        }
+        publishTracked(masks, displayID: displayID, timestamp: latest.timestamp, windows: latest.windows, token: token, revision: revision)
+    }
+
+    private func publishTracked(_ masks: [Mask], displayID: CGDirectDisplayID, timestamp: TimeInterval,
+                                windows: [WindowSignature], token: Int, revision: Int) {
+        let schedule = locked { () -> Bool in
+            guard running, generation == token, self.revision == revision, !fullFrameScanning,
+                  timestamp >= (deliveredTrackingTime[displayID] ?? -.infinity),
+                  timestamp >= (trackedDeliveries[displayID]?.timestamp ?? -.infinity) else { return false }
+            trackedDeliveries[displayID] = TrackedDelivery(masks: masks, timestamp: timestamp, windows: windows)
+            if trackingDeliveryScheduled { return false }
+            trackingDeliveryScheduled = true
+            return true
+        }
+        if schedule {
+            DispatchQueue.main.async { [weak self] in self?.flushTracking(token: token, revision: revision) }
+        }
+    }
+
+    private func flushTracking(token: Int, revision: Int) {
+        let deliveries = locked { () -> [CGDirectDisplayID: TrackedDelivery] in
+            guard running, generation == token, self.revision == revision else { return [:] }
+            trackingDeliveryScheduled = false
+            let result = trackedDeliveries
+            trackedDeliveries.removeAll(keepingCapacity: true)
+            for (displayID, value) in result { deliveredTrackingTime[displayID] = value.timestamp }
+            return result
+        }
+        for (displayID, value) in deliveries {
+            guard isActive(token, revision: revision) else { return }
+            onTrackedMasks?(displayID, value.masks, value.timestamp, value.windows)
+        }
     }
 
     fileprivate func report(_ message: String, token: Int, revision expectedRevision: Int? = nil, displayID: CGDirectDisplayID? = nil) {
