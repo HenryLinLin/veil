@@ -464,12 +464,14 @@ fn valid_length(validator: &str, value: &str, ocr: bool) -> Option<usize> {
 
 fn digits(value: &str, ocr: bool) -> Option<Zeroizing<Vec<u8>>> {
     let mut digits = Zeroizing::new(Vec::new());
-    for byte in value.bytes() {
-        match byte {
-            b'0'..=b'9' => digits.push(byte - b'0'),
-            b'O' if ocr => digits.push(0),
-            b'l' | b'I' if ocr => digits.push(1),
-            b' ' | b'-' | b'(' | b')' | b'+' => {}
+    for character in value.chars() {
+        match character {
+            '0'..='9' => digits.push(character as u8 - b'0'),
+            'O' if ocr => digits.push(0),
+            'l' | 'I' if ocr => digits.push(1),
+            '-' | '‐' | '‑' | '‒' | '–' | '—' | '−' | '﹣' | '－' | '(' | ')' | '+' =>
+                {}
+            c if c.is_whitespace() => {}
             _ => return None,
         }
     }

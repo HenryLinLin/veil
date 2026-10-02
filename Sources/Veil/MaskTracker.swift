@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 final class MaskTracker {
     private struct Held {
@@ -35,7 +36,10 @@ final class MaskTracker {
             return next
         }
         held.removeAll { entry in
-            fresh.contains { $0.rule == entry.mask.rule && $0.windowID == entry.mask.windowID && $0.rect.intersects(entry.mask.rect) }
+            fresh.contains {
+                $0.rule == entry.mask.rule && $0.windowID == entry.mask.windowID &&
+                    $0.hash == entry.mask.hash && $0.rect.contains(entry.mask.rect)
+            }
         }
         for mask in fresh {
             held.append(Held(mask: mask, expiry: now + 0.5, windowBounds: windows.first { $0.id == mask.windowID }?.bounds))
@@ -48,6 +52,9 @@ final class MaskTracker {
                 return mask
             }
         }
+    }
+    func invalidate(windowIDs: Set<CGWindowID>) {
+        held.removeAll { windowIDs.contains($0.mask.windowID) }
     }
     func reset() { held.removeAll() }
 }

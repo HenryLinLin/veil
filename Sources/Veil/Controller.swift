@@ -20,6 +20,13 @@ final class VeilController {
     private var captureTask: Task<Void, Never>?
     private var displayObserver: NSObjectProtocol?
     private var sleepObserver: NSObjectProtocol?
+    private var rescanWork: DispatchWorkItem?
+    private var scrollMonitor: Any?
+    private var localScrollMonitor: Any?
+    private var scrollProtection = ScrollProtection()
+    private var scanFailures = ScanFailures()
+    private var visibleWindows: [ScreenWindow] = []
+    private var displayBounds: [CGRect] = []
     private(set) var notice: String?
     init() {
         displayObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -97,7 +104,17 @@ final class VeilController {
     func toggle() { armed ? stop() : start() }
     func start(manual: Bool = true) {
         guard !armed else { if manual { manualSession = true }; return }
-        do { engine = try CoreEngine(config: store.current.engineJSON()) } catch { self.error = error.localizedDescription; changed?(); return }
+        let ocrEngine: CoreEngine
+        do {
+            let config = store.current.engineJSON()
+            engine = try CoreEngine(config: config)
+            ocrEngine = try CoreEngine(config: config)
+        } catch {
+            engine = nil
+            self.error = error.localizedDescription
+            changed?()
+            return
+        }
         if feedMode && !feed.isAvailable {
             engine = nil
             self.error = "Clean Feed requires Metal. Select Overlay on this Mac."
@@ -107,8 +124,19 @@ final class VeilController {
         self.error = nil
         manualSession = manual
         session.start()
-        accessibility.onMasks = { [weak self] masks in self?.textMasks = masks }
+        accessibility.onMasks = { [weak self] masks, startedAt in
+            guard let self, self.armed else { return }
+            self.textMasks = masks.filter { self.scrollProtection.accepts(windowID: $0.windowID, timestamp: startedAt) }
+        }
+        accessibility.onScanCompleted = { [weak self] ids, startedAt in
+            guard let self, self.armed, !self.store.current.ocr, !self.feedMode else { return }
+            self.scrollProtection.accessibilityScanned(windowIDs: ids, startedAt: startedAt)
+            self.refreshMasks()
+        }
         accessibility.onInvalidation = { [weak self] in self?.axDirty = true }
+        accessibility.onContentInvalidation = { [weak self] ids in
+            self?.protectScrollingWindows(ids, at: ProcessInfo.processInfo.systemUptime)
+        }
         accessibility.onPaths = { [weak self] found in
             guard let self, self.armed else { return }
             for (id, path) in found {
@@ -122,19 +150,33 @@ final class VeilController {
         armed = true
         sessionGeneration += 1
         let revision = sessionGeneration
-        let capture = ScreenCapture()
+        let capture = ScreenCapture(engine: ocrEngine)
         self.capture = capture
+        displayBounds = NSScreen.screens.compactMap {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { CGDisplayBounds($0.uint32Value) }
+        }
+        scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in self?.scrolled(event) }
+        localScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            self?.scrolled(event)
+            return event
+        }
         if feedMode {
             feed.prepare(displayIDs: NSScreen.screens.compactMap { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value })
         }
-        capture.onScannedFrame = { [weak self] frame, lines in
+        capture.onScannedFrame = { [weak self] frame, masks in
             guard let self, self.armed, self.sessionGeneration == revision else { return }
-            self.scanned(frame, lines: lines)
+            self.scanned(frame, fresh: masks)
         }
-        capture.onFailure = { [weak self] message in
+        capture.onFailure = { [weak self] message, displayID in
             guard let self, self.armed, self.sessionGeneration == revision else { return }
             self.error = message
-            self.feed.clear()
+            let ids = displayID.map { [$0] } ?? NSScreen.screens.compactMap {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            }
+            for id in ids { self.scanFailures.failed(displayID: id, at: ProcessInfo.processInfo.systemUptime) }
+            self.capture.requestFullScan()
+            self.feed.clear(displayID: displayID)
+            self.refreshMasks()
             self.changed?()
         }
         captureTask = Task { @MainActor [weak self] in
@@ -168,9 +210,19 @@ final class VeilController {
         sessionGeneration += 1
         captureTask?.cancel()
         captureTask = nil
+        rescanWork?.cancel()
+        rescanWork = nil
         timer?.invalidate()
         timer = nil
         armed = false
+        if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
+        if let localScrollMonitor { NSEvent.removeMonitor(localScrollMonitor) }
+        scrollMonitor = nil
+        localScrollMonitor = nil
+        scrollProtection.reset()
+        scanFailures.reset()
+        visibleWindows.removeAll()
+        displayBounds.removeAll()
         manualSession = false
         setPeek(false)
         accessibility.stop()
@@ -187,45 +239,115 @@ final class VeilController {
         changed?()
         if hadSession && showSummary { session.show() }
     }
-    private func scanned(_ frame: CapturedFrame, lines: [OCRLine]) {
-        guard armed, let engine else { return }
+    private func scrolled(_ event: NSEvent) {
+        guard armed, event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0 else { return }
+        if let localWindow = event.window, localWindow.title != "Veil Test" { return }
+        let location = event.cgEvent?.location ?? CGPoint(x: NSEvent.mouseLocation.x,
+            y: CGDisplayBounds(CGMainDisplayID()).height - NSEvent.mouseLocation.y)
+        guard let window = visibleWindows.first(where: { $0.layer == 0 && $0.bounds.contains(location) }),
+              !store.current.allowedPaths.contains(path(for: window)) else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let timestamp = event.timestamp.isFinite && event.timestamp <= now && now - event.timestamp < 2 ? event.timestamp : now
+        protectScrollingWindows([window.id], at: timestamp)
+    }
+
+    private func protectScrollingWindows(_ ids: Set<CGWindowID>, at timestamp: TimeInterval) {
+        guard armed else { return }
+        let affected = visibleWindows.filter { ids.contains($0.id) && !store.current.allowedPaths.contains(path(for: $0)) }
+        guard !affected.isEmpty else { return }
+        let ids = Set(affected.map(\.id))
+        for window in affected {
+            scrollProtection.scrolled(windowID: window.id, at: timestamp)
+            accessibility.prioritize(pid: window.pid)
+        }
+        tracker.invalidate(windowIDs: ids)
+        accessibility.invalidateContent(windowIDs: ids)
+        textMasks.removeAll { ids.contains($0.windowID) }
+        for id in Array(ocrMasks.keys) { ocrMasks[id]?.removeAll { ids.contains($0.windowID) } }
+        capture.requestFullScan()
+        scheduleRescan()
+        refreshMasks()
+    }
+
+    private func scanned(_ frame: CapturedFrame, fresh: [Mask]) {
+        guard armed else { return }
         let windows = ScreenWindow.visible()
+        visibleWindows = windows
         updateScene(windows)
-        if feedMode && (frame.windows != scene || sceneStableSince > frame.timestamp) {
-            feed.clear(displayID: frame.displayID)
+        guard frame.windows == scene, sceneStableSince <= frame.timestamp else {
+            capture.requestFullScan()
+            if feedMode { feed.clear(displayID: frame.displayID) }
             return
         }
-        var fresh: [Mask] = []
-        do {
-            for line in lines {
-                let owner = windows.first { $0.bounds.contains(CGPoint(x: line.bounds.midX, y: line.bounds.midY)) && $0.layer == 0 }
-                for hit in try engine.scan(line.text, title: owner?.title ?? "", path: owner.map { path(for: $0) } ?? "", ocr: true) {
-                    let rect = hit.rule == "private-key" ? (owner?.bounds ?? frame.displayBounds) :
-                        (line.bounds(forUTF8Range: hit.start..<hit.end) ?? line.bounds).insetBy(dx: -4, dy: -4)
-                    fresh.append(Mask(rect: rect.intersection(frame.displayBounds), rule: hit.rule,
-                                      app: owner?.app ?? "screen", hash: hit.hash, windowID: owner?.id ?? 0, anchor: owner?.bounds))
-                }
+        let fresh = fresh.filter { scrollProtection.accepts(windowID: $0.windowID, timestamp: frame.timestamp) }
+        ocrMasks[frame.displayID] = (ocrMasks[frame.displayID] ?? []).filter { !$0.rect.intersects(frame.scannedBounds) } + fresh
+        scrollProtection.scanned(bounds: frame.scannedBounds, timestamp: frame.timestamp)
+        if scanFailures.scanned(displayID: frame.displayID, displayBounds: frame.displayBounds,
+                                scannedBounds: frame.scannedBounds, timestamp: frame.timestamp), scanFailures.since.isEmpty {
+            error = nil
+        }
+        refreshMasks()
+        if feedMode {
+            let windowMasks = windows.filter { windowRule(for: $0) != nil }
+                .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
+            let staleWindows = windows.filter { !scrollProtection.accepts(windowID: $0.id, timestamp: frame.timestamp) }
+                .map { Mask(rect: $0.bounds, rule: "scrolling-text", app: $0.app, windowID: $0.id) }
+            let current = (fresh + windowMasks + textMasks + scrollMasks() + staleWindows + failureMasks()).filter { permitted($0, in: windows) }
+            let sx = Double(frame.image.width) / frame.displayBounds.width
+            let sy = Double(frame.image.height) / frame.displayBounds.height
+            let rects = current.compactMap { mask -> CGRect? in
+                let r = mask.rect.intersection(frame.displayBounds)
+                guard !r.isNull, !r.isEmpty else { return nil }
+                return CGRect(x: (r.minX - frame.displayBounds.minX) * sx, y: (r.minY - frame.displayBounds.minY) * sy, width: r.width * sx, height: r.height * sy)
             }
-            ocrMasks[frame.displayID] = (ocrMasks[frame.displayID] ?? []).filter { !$0.rect.intersects(frame.scannedBounds) } + fresh
-            if feedMode {
-                let windowMasks = windows.filter { window in self.windowRule(for: window) != nil }
-                    .map { Mask(rect: $0.bounds, rule: "sensitive-window", app: $0.app, windowID: $0.id) }
-                let current = (fresh + windowMasks + textMasks).filter { permitted($0, in: windows) }
-                let sx = Double(frame.image.width) / frame.displayBounds.width
-                let sy = Double(frame.image.height) / frame.displayBounds.height
-                let rects = current.compactMap { mask -> CGRect? in
-                    let r = mask.rect.intersection(frame.displayBounds)
-                    guard !r.isNull, !r.isEmpty else { return nil }
-                    return CGRect(x: (r.minX - frame.displayBounds.minX) * sx, y: (r.minY - frame.displayBounds.minY) * sy, width: r.width * sx, height: r.height * sy)
-                }
-                feed.publish(displayID: frame.displayID, image: frame.image, masks: rects, delay: store.current.delay)
-            }
-        } catch {
-            self.error = error.localizedDescription
-            feed.clear()
-            ocrMasks[frame.displayID] = [Mask(rect: frame.displayBounds, rule: "detector-error", app: "screen")]
+            feed.publish(displayID: frame.displayID, image: frame.image, masks: rects, delay: store.current.delay)
         }
     }
+
+    private func scheduleRescan() {
+        rescanWork?.cancel()
+        let revision = sessionGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.armed, self.sessionGeneration == revision else { return }
+            self.rescanWork = nil
+            self.axDirty = true
+            if self.store.current.ocr || self.feedMode { self.capture.rescanNow() }
+        }
+        rescanWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + scrollProtection.settleInterval + 0.02, execute: work)
+    }
+
+    private func scrollMasks() -> [Mask] {
+        visibleWindows.filter { scrollProtection.windowIDs.contains($0.id) }.flatMap { window in
+            window.visibleParts(of: window.bounds, in: visibleWindows).map {
+                Mask(rect: $0, rule: "scrolling-text", app: window.app, windowID: window.id)
+            }
+        }
+    }
+
+    private func failureMasks() -> [Mask] {
+        scanFailures.since.keys.map { Mask(rect: CGDisplayBounds($0), rule: "detector-error", app: "screen") }
+    }
+
+    private func refreshMasks() {
+        guard armed else { return }
+        let released = scrollProtection.update(windows: visibleWindows, displays: displayBounds,
+                                               now: ProcessInfo.processInfo.systemUptime)
+        tracker.invalidate(windowIDs: released)
+        if store.current.ocr || feedMode { textMasks.removeAll { released.contains($0.windowID) } }
+        let current = visibleWindows.flatMap { window -> [Mask] in
+            guard let rule = windowRule(for: window) else { return [] }
+            return window.visibleParts(of: window.bounds, in: visibleWindows).map {
+                Mask(rect: $0, rule: rule.id, app: window.app, windowID: window.id)
+            }
+        }
+        let detected = (current + textMasks + ocrMasks.values.flatMap { $0 }).filter { permitted($0, in: visibleWindows) }
+        masks = tracker.update(detected, windows: visibleWindows)
+        session.record(masks)
+        masks += scrollMasks() + failureMasks()
+        if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
+    }
+
     private func path(for window: ScreenWindow) -> String {
         guard let value = paths[window.id], value.title == window.title.hashValue else { return "" }
         return value.path
@@ -246,34 +368,31 @@ final class VeilController {
         if next != scene || !sceneStableSince.isFinite {
             scene = next
             sceneStableSince = ProcessInfo.processInfo.systemUptime
+            scheduleRescan()
         }
     }
     private func tick() {
         let windows = ScreenWindow.visible()
         updateScene(windows)
-        let current = windows.flatMap { window -> [Mask] in
-            guard let rule = windowRule(for: window) else { return [] }
-            return window.visibleParts(of: window.bounds, in: windows).map {
-                Mask(rect: $0, rule: rule.id, app: window.app, windowID: window.id)
-            }
-        }
+        visibleWindows = windows
         paths = paths.filter { id, value in windows.contains { $0.id == id && $0.title.hashValue == value.title } }
+        capture.updatePaths(paths)
         let now = ProcessInfo.processInfo.systemUptime
-        if let engine, !accessibility.isScanning, (axDirty && now - lastAX >= 0.2) || now - lastAX >= 0.8 {
+        if let engine, !accessibility.isScanning, (axDirty && now - lastAX >= 0.1) || now - lastAX >= 0.4 {
             scanTitles = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0.title.hashValue) })
             axDirty = false
             lastAX = now
             accessibility.scan(windows: windows, engine: engine)
         }
-        let detected = (current + textMasks + ocrMasks.values.flatMap { $0 }).filter { permitted($0, in: windows) }
-        masks = tracker.update(detected, windows: windows)
-        session.record(masks)
-        if feedMode || peeking { overlays.clear() } else { overlays.show(masks) }
+        refreshMasks()
         changed?()
     }
 
     deinit {
         captureTask?.cancel()
+        rescanWork?.cancel()
+        if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
+        if let localScrollMonitor { NSEvent.removeMonitor(localScrollMonitor) }
         if let displayObserver { NotificationCenter.default.removeObserver(displayObserver) }
         if let sleepObserver { NSWorkspace.shared.notificationCenter.removeObserver(sleepObserver) }
     }

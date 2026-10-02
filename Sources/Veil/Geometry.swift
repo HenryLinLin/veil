@@ -22,7 +22,7 @@ struct ScreenWindow {
         let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         return rows.compactMap { row in
             guard let pid = row[kCGWindowOwnerPID as String] as? Int32,
-                  pid != ProcessInfo.processInfo.processIdentifier,
+                  (pid != ProcessInfo.processInfo.processIdentifier || row[kCGWindowName as String] as? String == "Veil Test"),
                   let id = row[kCGWindowNumber as String] as? UInt32,
                   let dict = row[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: dict as CFDictionary),
@@ -85,7 +85,7 @@ struct WindowSignature: Equatable {
         let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         return rows.compactMap { row in
             guard let pid = row[kCGWindowOwnerPID as String] as? Int32,
-                  pid != ProcessInfo.processInfo.processIdentifier,
+                  (pid != ProcessInfo.processInfo.processIdentifier || row[kCGWindowName as String] as? String == "Veil Test"),
                   let id = row[kCGWindowNumber as String] as? UInt32,
                   let dict = row[kCGWindowBounds as String] as? [String: Any],
                   let rect = CGRect(dictionaryRepresentation: dict as CFDictionary), rect.width > 1, rect.height > 1,
